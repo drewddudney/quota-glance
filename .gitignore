@@ -1,0 +1,33 @@
+.DS_Store
+
+# Swift / Xcode build products
+.build/
+.build-*/
+DerivedData/
+.xcode-derived/
+.device-derived/
+*.xcarchive
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# XcodeGen output and per-user state
+*.xcodeproj/
+xcuserdata/
+*.xcuserstate
+
+# Signing material and local configuration
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+*.key
+Config.local.xcconfig
+
+# Local credentials, logs, caches, and exports
+.env
+.env.*
+!.env.example
+*.log
+outputs/
+Pack/
