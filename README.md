@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/mac-compact.png" width="205" alt="Quota Glance mounted in a Mac screen corner">
-  &nbsp;&nbsp;&nbsp;
+  <img src="docs/images/mac-horizontal.png" width="520" alt="Quota Glance horizontal macOS dashboard">
+  <br><br>
   <img src="docs/images/iphone-glance.png" width="245" alt="Quota Glance iPhone dashboard">
   &nbsp;&nbsp;&nbsp;
   <img src="docs/images/iphone-pace.png" width="245" alt="Quota Glance usage pace chart">
@@ -35,7 +35,42 @@
 - Supports Time Sensitive notifications for reset announcements and completed resets.
 - Syncs through the user's private CloudKit database—there is no shared backend or shared login.
 
-## Screenshots
+## macOS in detail
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/mac-dashboard.png" width="190" alt="Vertical floating dashboard"><br>
+      <sub><strong>Vertical dashboard</strong><br>Three meters, live run-out pace, reset countdown, and posts at a glance.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/mac-horizontal.png" width="430" alt="Horizontal floating dashboard"><br>
+      <sub><strong>Horizontal dashboard</strong><br>The same information in a low-profile desktop layout.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/mac-pace.png" width="390" alt="Live token usage pace graph"><br>
+      <sub><strong>Live token pace</strong><br>Saved quota and token history, selectable time windows, ideal pace, burn, and time-to-empty.</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/mac-reset-intelligence.png" width="360" alt="Reset intelligence and provider comparison"><br>
+      <sub><strong>Reset intelligence</strong><br>Local-time countdown, active signals, wait statistics, and every provider side by side.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/mac-posts.png" width="370" alt="Deduplicated reset post feed"><br>
+      <sub><strong>Reset post feed</strong><br>Reset-only or all-post filters with reply context and cross-provider deduplication.</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/mac-compact.png" width="210" alt="Mounted corner rings"><br>
+      <sub><strong>Mounted corner mode</strong><br>Drag to a screen edge or corner for a compact three-ring view.</sub>
+    </td>
+  </tr>
+</table>
+
+## iPhone companion
 
 <p align="center">
   <img src="docs/images/iphone-glance.png" width="220" alt="Glance dashboard">
