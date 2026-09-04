@@ -13,11 +13,10 @@
     <key>ITSAppUsesNonExemptEncryption</key><false/>
     <key>LSRequiresIPhoneOS</key><true/>
     <key>NSSupportsLiveActivities</key><true/>
+    <key>NSSupportsLiveActivitiesFrequentUpdates</key><true/>
     <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
     <key>UIBackgroundModes</key><array><string>fetch</string><string>remote-notification</string></array>
-    <key>BGTaskSchedulerPermittedIdentifiers</key><array><string>$(PRODUCT_BUNDLE_IDENTIFIER).refresh</string></array>
-    <key>QuotaGlanceCloudContainerIdentifier</key><string>iCloud.com.example.quotaglance</string>
-    <key>QuotaGlanceAppGroupIdentifier</key><string>group.com.example.quotaglance</string>
+    <key>BGTaskSchedulerPermittedIdentifiers</key><array><string>com.drewdudney.quotaglance.refresh</string></array>
     <key>UILaunchScreen</key><dict/>
     <key>UIRequiresFullScreen</key><true/>
     <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>

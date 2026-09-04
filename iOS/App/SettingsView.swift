@@ -2,9 +2,8 @@ import SwiftUI
 import UserNotifications
 
 struct SettingsView: View {
-    @Binding var selectedSource: ResetSource
+    @ObservedObject var store: DashboardStore
     @Binding var selectedTheme: MobileTheme
-    @Environment(\.dismiss) private var dismiss
     @State private var preferences = NotificationPreferences.load()
     @State private var notificationStatus = "Checking…"
 
@@ -20,20 +19,21 @@ struct SettingsView: View {
                 }
 
                 Section("Reset calculator") {
-                    Picker("Source", selection: $selectedSource) {
-                        ForEach(ResetSource.allCases) { source in
-                            Text(source.name).tag(source)
-                        }
+                    ForEach(ResetSource.calculatorCases) { source in
+                        Toggle(source.name, isOn: store.binding(for: source))
                     }
+                    Text("The reset dial averages the checked calculators that currently publish a percentage.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section {
                     Toggle("Reset announced", isOn: $preferences.resetAnnounced)
                     Toggle("Reset completed", isOn: $preferences.resetCompleted)
                     if preferences.resetAnnounced || preferences.resetCompleted {
-                        Toggle("Prominent reset alert", isOn: $preferences.prominentResetAlert)
+                        Toggle("Emergency-style reset alert", isOn: $preferences.prominentResetAlert)
                         Text(preferences.prominentResetAlert
-                             ? "Time Sensitive, with sound and a live countdown. It may break through Focus, but uses no government emergency-alert channel."
+                             ? "Time Sensitive, with the reset sound, a high-visibility in-app banner, and a Live Activity countdown. It may break through Focus, but uses no government emergency-alert channel."
                              : "Delivered as a normal notification with a Live Activity countdown.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
@@ -52,11 +52,13 @@ struct SettingsView: View {
                     Toggle("Reset credit expiring", isOn: $preferences.resetCreditExpiring)
                     Toggle("Likely to run out early", isOn: $preferences.paceRisk)
                     Toggle("New Tibo posts", isOn: $preferences.tiboPosts)
+                    Toggle("Codex task changes", isOn: $preferences.codexTasks)
+                    Toggle("Live Codex session", isOn: $preferences.sessionLiveActivity)
                     Toggle("Mac sync is stale", isOn: $preferences.staleSync)
                 } header: {
                     Text("Notifications")
                 } footer: {
-                    Text("Quota Glance only schedules alerts you enable. Reset announcements are deduplicated across all four sources.")
+                    Text("Live Codex session shows usage and token burn on your Lock Screen while the Mac detects active work. Delivery timing is managed by iOS.")
                 }
 
                 Section("Permission") {
@@ -83,11 +85,6 @@ struct SettingsView: View {
             }
             .navigationTitle("Quota Glance")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
             .task { await refreshAuthorizationStatus() }
             .onChange(of: preferences.resetAnnounced) { preferences.save() }
             .onChange(of: preferences.resetCompleted) { preferences.save() }
@@ -98,6 +95,8 @@ struct SettingsView: View {
             .onChange(of: preferences.resetCreditExpiring) { preferences.save() }
             .onChange(of: preferences.paceRisk) { preferences.save() }
             .onChange(of: preferences.tiboPosts) { preferences.save() }
+            .onChange(of: preferences.codexTasks) { preferences.save() }
+            .onChange(of: preferences.sessionLiveActivity) { preferences.save() }
             .onChange(of: preferences.staleSync) { preferences.save() }
         }
     }

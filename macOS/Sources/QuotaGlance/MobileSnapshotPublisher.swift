@@ -23,6 +23,80 @@ struct MobileTokenPace: Codable, Sendable {
     let sinceReset: Int64
 }
 
+struct MobileUsageIntelligence: Codable, Sendable {
+    let apiEquivalentUSD: Double
+    let quotaWeightedUSD: Double
+    let pricingCoverage: Double
+    let speedCoverage: Double
+    let fastShare: Double
+    let eventCount: Int
+    let ledgerBytes: Int64
+    let topModel: String?
+    let totalTokens: Int64?
+    let cacheHitRate: Double?
+    let costTimeline: [MobileCostPoint]?
+}
+
+struct MobileCostPoint: Codable, Sendable {
+    let date: Date
+    let apiEquivalentUSD: Double
+}
+
+struct MobileWeeklyArchivePoint: Codable, Sendable {
+    let date: Date
+    let usedPercent: Double
+    let apiEquivalentUSD: Double?
+}
+
+struct MobileWeeklyArchive: Codable, Sendable {
+    let windowStart: Date
+    let resetAt: Date
+    let finalUsedPercent: Double
+    let totalTokens: Int64?
+    let apiEquivalentUSD: Double?
+    let cacheHitRate: Double?
+    let fastShare: Double?
+    let topModel: String?
+    let points: [MobileWeeklyArchivePoint]
+}
+
+struct MobileSecondaryQuota: Codable, Sendable {
+    let usedPercent: Double
+    let resetAt: Date
+    let windowDurationMinutes: Double
+}
+
+struct MobileQuotaWindow: Codable, Sendable {
+    let id: String
+    let label: String
+    let scope: String
+    let usedPercent: Double
+    let resetAt: Date
+    let windowDurationMinutes: Double
+}
+
+struct MobileCreditSummary: Codable, Sendable {
+    let hasCredits: Bool
+    let unlimited: Bool
+    let balance: String?
+}
+
+struct MobileResetCredit: Codable, Sendable {
+    let id: String
+    let resetType: String
+    let status: String
+    let expiresAt: Date?
+    let description: String?
+}
+
+struct MobileCodexTask: Codable, Sendable {
+    let id: String
+    let name: String
+    let state: String
+    let source: String
+    let updatedAt: Date
+}
+
 struct MobileTiboPost: Codable, Sendable {
     let id: String
     let date: Date?
@@ -44,12 +118,17 @@ struct MobileQuotaSnapshot: Codable, Sendable {
     let planName: String?
     let renewalDate: Date?
     let selectedSource: String
+    let selectedSources: [String]?
     let providers: [MobileProviderReading]
     let resetAnnounced: Bool
     let announcementID: String?
     let announcementText: String?
     let announcementDate: Date?
     let announcementExpectedAt: Date?
+    let announcementRequiresApplicabilityConfirmation: Bool?
+    let announcementAppliesToAccount: Bool?
+    let announcementApplicabilityAnsweredAt: Date?
+    let resetCompletedAt: Date?
     let announcementURL: URL?
     let lastBlessingAt: Date?
     let resetCreditExpiresAt: Date?
@@ -58,23 +137,24 @@ struct MobileQuotaSnapshot: Codable, Sendable {
     let forecastUpdatedAt: Date?
     let usageHistory: [MobileUsagePoint]?
     let tokenPace: MobileTokenPace?
+    let usageIntelligence: MobileUsageIntelligence?
+    let secondaryQuota: MobileSecondaryQuota?
+    let quotaInventory: [MobileQuotaWindow]?
+    let creditSummary: MobileCreditSummary?
+    let resetCredits: [MobileResetCredit]?
+    let activeTasks: [MobileCodexTask]?
+    let weeklyArchives: [MobileWeeklyArchive]?
     let tiboPosts: [MobileTiboPost]?
 }
 
 actor MobileSnapshotPublisher {
     static let shared = MobileSnapshotPublisher()
 
-    private static var containerIdentifier: String {
-        Bundle.main.object(forInfoDictionaryKey: "QuotaGlanceCloudContainerIdentifier") as? String
-            ?? "iCloud.com.example.quotaglance"
-    }
+    private static let containerIdentifier = "iCloud.com.drewdudney.quotaglance"
     private static let keyValueSnapshotKey = "QuotaGlance.snapshot.v1"
     private static let recordType = "QuotaGlanceSnapshot"
     private static let recordID = CKRecord.ID(recordName: "current-v1")
-    private static let logger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.example.quotaglance",
-        category: "PhoneSync"
-    )
+    private static let logger = Logger(subsystem: "com.drewdudney.quotaglance", category: "PhoneSync")
     private static let lastAttemptKey = "mobileSnapshotLastAttemptAt"
     private static let lastSuccessKey = "mobileSnapshotLastSuccessAt"
     private static let lastErrorKey = "mobileSnapshotLastError"
@@ -122,6 +202,7 @@ actor MobileSnapshotPublisher {
             UserDefaults.standard.set(Date(), forKey: Self.lastSuccessKey)
             UserDefaults.standard.removeObject(forKey: Self.lastErrorKey)
             Self.logger.notice("Phone snapshot saved to private CloudKit")
+            await PrivateLiveActivityRelay.shared.sync(snapshot)
         } catch {
             recordFailure(error.localizedDescription)
         }

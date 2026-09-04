@@ -8,36 +8,39 @@ struct PublicForecast: Sendable {
     let announcementText: String?
     let announcementDate: Date?
     let announcementExpectedAt: Date?
+    let announcementRequiresApplicabilityConfirmation: Bool
     let announcementURL: URL?
     let lastBlessingAt: Date?
     let tiboPosts: [QuotaTiboPost]
 }
 
 enum ResetProviderService {
-    static func fetch(selected: ResetSource) async throws -> PublicForecast {
+    static func fetch(selected: Set<ResetSource>) async throws -> PublicForecast {
         async let lunar = optional { try await fetchLunar() }
         async let codexResets = optional { try await fetchCodexResets() }
         async let will = optional { try await fetchWill() }
         async let gussuri = optional { try await fetchGussuri() }
+        async let polymarket = optional { try await fetchPolymarket() }
 
-        let results = await [lunar, codexResets, will, gussuri].compactMap { $0 }
+        let results = await [lunar, codexResets, will, gussuri, polymarket].compactMap { $0 }
         guard !results.isEmpty else { throw URLError(.cannotLoadFromNetwork) }
         let readings = results.map(\.reading)
-        let scored = readings.compactMap(\.percent)
+        let scored = readings
+            .filter { selected.contains($0.source) }
+            .compactMap(\.percent)
         let mean = scored.isEmpty ? nil : scored.reduce(0, +) / Double(scored.count)
-        let selectedPercent = selected == .average
-            ? mean
-            : readings.first(where: { $0.source == selected })?.percent ?? mean
+        let selectedPercent = mean ?? 0
         let providerAnnouncement = results
             .compactMap(\.announcement)
             .filter { $0.detectedAt > Date().addingTimeInterval(-36 * 3_600) }
             .max { $0.detectedAt < $1.detectedAt }
         var postsByID: [String: QuotaTiboPost] = [:]
         for post in results.flatMap(\.posts) {
-            let previous = postsByID[post.id]
+            let identity = post.canonicalIdentity
+            let previous = postsByID[identity]
             let oldDetail = (previous?.text.count ?? 0) + (previous?.inReplyTo?.count ?? 0)
             let newDetail = post.text.count + (post.inReplyTo?.count ?? 0)
-            if previous == nil || newDetail > oldDetail { postsByID[post.id] = post }
+            if previous == nil || newDetail > oldDetail { postsByID[identity] = post }
         }
         let recentCutoff = Date().addingTimeInterval(-7 * 86_400)
         let tiboPosts = postsByID.values
@@ -48,7 +51,7 @@ enum ResetProviderService {
                 post.isResetOriented,
                 let postedAt = post.date,
                 let expectedAt = ResetAnnouncementTimeParser.expectedDate(in: post.text, postedAt: postedAt),
-                expectedAt > Date().addingTimeInterval(-5 * 60)
+                expectedAt > Date().addingTimeInterval(-12 * 3_600)
             else { return nil }
             return Announcement(
                 id: "scheduled:\(post.id)",
@@ -77,12 +80,15 @@ enum ResetProviderService {
 
         return PublicForecast(
             providers: readings,
-            selectedPercent: announcement == nil ? selectedPercent : 100,
+            selectedPercent: selectedPercent,
             resetAnnounced: announcement != nil,
             announcementID: announcement?.id,
             announcementText: announcement?.text,
             announcementDate: announcement?.detectedAt,
             announcementExpectedAt: announcement?.expectedAt,
+            announcementRequiresApplicabilityConfirmation: announcement.map {
+                ResetApplicability.requiresConfirmation($0.text)
+            } ?? false,
             announcementURL: announcement?.url,
             lastBlessingAt: results.compactMap(\.lastBlessingAt).max(),
             tiboPosts: tiboPosts
@@ -265,6 +271,47 @@ enum ResetProviderService {
             ),
             announcement: announcement,
             lastBlessingAt: capture(#""latestWindow":\{[\s\S]*?"closedAt":"([^"]+)""#, in: html).flatMap(date(_:)),
+            posts: []
+        )
+    }
+
+    private static func fetchPolymarket() async throws -> Result {
+        let slug = "openai-resets-codex-weekly-usage-limit-byptptpt-20260901192000000"
+        let rootData = try await data(from: URL(string: "https://gamma-api.polymarket.com/events/slug/\(slug)")!)
+        guard
+            let root = try JSONSerialization.jsonObject(with: rootData) as? [String: Any],
+            let markets = root["markets"] as? [[String: Any]]
+        else { throw URLError(.cannotParseResponse) }
+
+        let now = Date()
+        let candidates = markets.compactMap { market -> (Date, Double)? in
+            guard
+                (market["active"] as? Bool) != false,
+                (market["closed"] as? Bool) != true,
+                let deadlineText = market["endDate"] as? String,
+                let deadline = date(deadlineText), deadline > now,
+                let outcomesText = market["outcomes"] as? String,
+                let pricesText = market["outcomePrices"] as? String,
+                let outcomesData = outcomesText.data(using: .utf8),
+                let pricesData = pricesText.data(using: .utf8),
+                let outcomes = try? JSONDecoder().decode([String].self, from: outcomesData),
+                let prices = try? JSONDecoder().decode([String].self, from: pricesData),
+                let yesIndex = outcomes.firstIndex(where: { $0.caseInsensitiveCompare("yes") == .orderedSame }),
+                prices.indices.contains(yesIndex), let yes = Double(prices[yesIndex])
+            else { return nil }
+            return (deadline, yes)
+        }
+        guard let earliest = candidates.min(by: { $0.0 < $1.0 }) else {
+            throw URLError(.cannotParseResponse)
+        }
+        return Result(
+            reading: ProviderReading(
+                source: .polymarket,
+                percent: earliest.1 * 100,
+                updatedAt: (root["updatedAt"] as? String).flatMap(date(_:)) ?? now
+            ),
+            announcement: nil,
+            lastBlessingAt: nil,
             posts: []
         )
     }

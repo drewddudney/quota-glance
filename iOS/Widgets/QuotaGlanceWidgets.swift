@@ -69,9 +69,9 @@ struct QuotaWidgetView: View {
                     row("WEEK", entry.snapshot.weekElapsedPercent, Color(hex: QuotaColors.calendar))
                     row("USED", entry.snapshot.usagePercent, Color(hex: QuotaColors.usage))
                     row("RESET", entry.snapshot.effectiveResetChance, Color(hex: QuotaColors.reset))
-                    Text(entry.snapshot.resetAnnounced ? "🔥 USE IT NOW" : entry.snapshot.selectedSource.name.uppercased())
+                    Text(entry.snapshot.effectiveResetAnnounced ? "🔥 USE IT NOW" : entry.snapshot.resetSourceLabel.uppercased())
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(entry.snapshot.resetAnnounced ? Color.orange : .white.opacity(0.42))
+                        .foregroundStyle(entry.snapshot.effectiveResetAnnounced ? Color.orange : .white.opacity(0.42))
                         .lineLimit(1)
                 }
             }
@@ -128,7 +128,7 @@ private struct LockScreenRings: View {
                 )
                 ring(
                     snapshot.effectiveResetChance,
-                    color: snapshot.resetAnnounced ? .orange : Color(hex: QuotaColors.reset),
+                    color: snapshot.effectiveResetAnnounced ? .orange : Color(hex: QuotaColors.reset),
                     inset: stroke * 0.55 + step * 2,
                     stroke: stroke
                 )
@@ -162,12 +162,12 @@ private struct WidgetRings: View {
                 ring(snapshot.usagePercent ?? 0, Color(hex: QuotaColors.usage), side * 0.19)
                 ring(
                     snapshot.effectiveResetChance,
-                    snapshot.resetAnnounced ? Color.orange : Color(hex: QuotaColors.reset),
+                    snapshot.effectiveResetAnnounced ? Color.orange : Color(hex: QuotaColors.reset),
                     side * 0.30
                 )
-                Image(systemName: snapshot.resetAnnounced ? "flame.fill" : "arrow.triangle.2.circlepath")
+                Image(systemName: snapshot.effectiveResetAnnounced ? "flame.fill" : "arrow.triangle.2.circlepath")
                     .font(.system(size: side * 0.13, weight: .bold))
-                    .foregroundStyle(snapshot.resetAnnounced ? Color.orange : Color(hex: QuotaColors.reset))
+                    .foregroundStyle(snapshot.effectiveResetAnnounced ? Color.orange : Color(hex: QuotaColors.reset))
             }
             .frame(width: side, height: side)
         }
@@ -210,11 +210,11 @@ struct ResetCountdownLiveActivity: Widget {
                     .background(Color(hex: QuotaColors.reset).opacity(0.14), in: Circle())
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("CODEX RESET")
+                    Text(context.state.isDelayed ? "RESET DELAYED" : "CODEX RESET")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    Text(context.state.expectedAt, style: .timer)
-                        .font(.system(size: 25, weight: .semibold, design: .rounded))
+                    countdownText(context.state)
+                        .font(.system(size: context.state.isDelayed ? 17 : 25, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                 }
 
@@ -243,10 +243,10 @@ struct ResetCountdownLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     HStack {
-                        Text("Codex reset")
+                        Text(context.state.isDelayed ? "Reset delayed" : "Codex reset")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(context.state.expectedAt, style: .timer)
+                        countdownText(context.state)
                             .font(.system(.title3, design: .rounded, weight: .semibold))
                             .monospacedDigit()
                     }
@@ -255,7 +255,7 @@ struct ResetCountdownLiveActivity: Widget {
                 Image(systemName: "hourglass")
                     .foregroundStyle(Color(hex: QuotaColors.reset))
             } compactTrailing: {
-                Text(context.state.expectedAt, style: .timer)
+                countdownText(context.state)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .frame(maxWidth: 52)
@@ -266,6 +266,137 @@ struct ResetCountdownLiveActivity: Widget {
             .keylineTint(Color(hex: QuotaColors.reset))
         }
     }
+
+    @ViewBuilder
+    private func countdownText(_ state: ResetCountdownAttributes.ContentState) -> some View {
+        if state.isDelayed {
+            Text("DELAYED")
+        } else {
+            // A timer interval stops at zero. Date's `.timer` style begins
+            // counting upward after its target, which made late resets lie.
+            Text(timerInterval: min(Date(), state.expectedAt)...state.expectedAt, countsDown: true)
+        }
+    }
+}
+
+struct CodexSessionLiveActivity: Widget {
+    private let blue = Color(hex: QuotaColors.usage)
+
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: CodexSessionActivityAttributes.self) { context in
+            HStack(spacing: 14) {
+                Text(">_")
+                    .font(.system(size: 19, weight: .bold, design: .monospaced))
+                    .foregroundStyle(blue)
+                    .frame(width: 44, height: 44)
+                    .background(blue.opacity(0.14), in: Circle())
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(context.state.taskName)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                    Text("\(tokenText(context.state.totalTokens)) · \(rateText(context.state.tokensPerMinute))")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    projectedPercentage(context.state, size: 22)
+                    Text(context.state.updatedAt, style: .relative)
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 108, alignment: .trailing)
+                .layoutPriority(2)
+            }
+            .padding(.horizontal, 16)
+            .activityBackgroundTint(Color(hex: 0x0A0E11))
+            .activitySystemActionForegroundColor(.white)
+        } dynamicIsland: { context in
+            DynamicIsland {
+                DynamicIslandExpandedRegion(.leading) {
+                    Text(">_")
+                        .font(.system(.body, design: .monospaced, weight: .bold))
+                        .foregroundStyle(blue)
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    projectedPercentage(context.state, size: 18)
+                        .frame(minWidth: 76, alignment: .trailing)
+                }
+                DynamicIslandExpandedRegion(.center) {
+                    Text(context.state.taskName)
+                        .font(.system(.caption, design: .rounded, weight: .semibold))
+                        .lineLimit(1)
+                }
+                DynamicIslandExpandedRegion(.bottom) {
+                    HStack {
+                        Label(tokenText(context.state.totalTokens), systemImage: "number")
+                        Spacer()
+                        Label(rateText(context.state.tokensPerMinute), systemImage: "gauge.with.dots.needle.67percent")
+                    }
+                    .font(.system(.caption, design: .monospaced, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                }
+            } compactLeading: {
+                Text(">_")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundStyle(blue)
+            } compactTrailing: {
+                projectedPercentage(context.state, size: 10)
+            } minimal: {
+                Text(">_")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(blue)
+            }
+            .keylineTint(blue)
+        }
+    }
+
+    @ViewBuilder
+    private func projectedPercentage(
+        _ state: CodexSessionActivityAttributes.ContentState,
+        size: CGFloat
+    ) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let percent = CodexSessionUsageProjection.projectedPercent(
+                basePercent: state.usedPercent,
+                percentPerMinute: state.percentPerMinute ?? 0,
+                updatedAt: state.updatedAt,
+                now: timeline.date
+            )
+            Text(String(format: "%.3f%%", percent))
+                .font(.system(size: size, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+                .allowsTightening(true)
+                .layoutPriority(2)
+                .foregroundStyle(blue)
+        }
+    }
+
+    private func tokenText(_ tokens: Int64) -> String {
+        compact(tokens, suffix: " tokens")
+    }
+
+    private func rateText(_ tokens: Int64) -> String {
+        tokens > 0 ? compact(tokens, suffix: "/min") : "syncing"
+    }
+
+    private func compact(_ value: Int64, suffix: String) -> String {
+        let number = Double(max(0, value))
+        if number >= 1_000_000_000 {
+            return String(format: "%.2fB", number / 1_000_000_000) + suffix
+        }
+        if number >= 1_000_000 {
+            return String(format: "%.1fM", number / 1_000_000) + suffix
+        }
+        if number >= 1_000 {
+            return String(format: "%.1fK", number / 1_000) + suffix
+        }
+        return "\(value)" + suffix
+    }
 }
 
 @main
@@ -273,6 +404,7 @@ struct QuotaGlanceWidgetBundle: WidgetBundle {
     var body: some Widget {
         QuotaGlanceWidget()
         ResetCountdownLiveActivity()
+        CodexSessionLiveActivity()
     }
 }
 

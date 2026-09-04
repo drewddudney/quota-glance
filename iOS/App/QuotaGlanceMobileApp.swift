@@ -9,15 +9,30 @@ struct QuotaGlanceMobileApp: App {
     var body: some Scene {
         WindowGroup {
             DashboardView(store: store)
-                .task { await store.start() }
-                .onReceive(NotificationCenter.default.publisher(for: .quotaCloudChanged)) { _ in
-                    Task { await store.refresh() }
+                .task(id: scenePhase) {
+                    guard scenePhase == .active else { return }
+                    await store.start()
+                    await store.runForegroundSyncLoop()
                 }
-        }
-        .onChange(of: scenePhase) {
-            if scenePhase == .active {
-                Task { await store.refresh() }
-            }
+                .onReceive(NotificationCenter.default.publisher(for: .quotaCloudChanged)) { _ in
+                    Task { await store.refreshFromSharedSnapshotIfNew() }
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: NSUbiquitousKeyValueStore.didChangeExternallyNotification
+                    )
+                ) { notification in
+                    let changedKeys = notification.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey]
+                        as? [String]
+                    if changedKeys == nil
+                        || changedKeys?.contains(ResetApplicability.cloudKey) == true {
+                        Task { await store.refreshResetApplicabilityFromCloud() }
+                    }
+                    if changedKeys == nil
+                        || changedKeys?.contains(CloudSnapshotService.keyValueSnapshotKey) == true {
+                        Task { await store.refreshCloudSnapshotIfNew() }
+                    }
+                }
         }
     }
 }

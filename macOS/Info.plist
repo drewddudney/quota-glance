@@ -9,9 +9,11 @@
     <key>CFBundleExecutable</key>
     <string>QuotaGlance</string>
     <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
+    <string>com.drewdudney.quotaglance</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
     <key>CFBundleName</key>
     <string>Quota Glance</string>
     <key>CFBundlePackageType</key>
@@ -28,7 +30,5 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>QuotaGlanceCloudContainerIdentifier</key>
-    <string>iCloud.com.example.quotaglance</string>
 </dict>
 </plist>

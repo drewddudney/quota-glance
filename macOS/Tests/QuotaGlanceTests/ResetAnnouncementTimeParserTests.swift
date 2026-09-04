@@ -23,14 +23,26 @@ final class ResetAnnouncementTimeParserTests: XCTestCase {
         XCTAssertEqual(components.minute, 0)
     }
 
-    func testRelativeResetWindowIsConvertedToAnAbsoluteInstant() throws {
+    func testRelativeWindowDoesNotCreateALiveCountdown() throws {
         let postedAt = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-08-13T01:01:37Z"))
-        XCTAssertEqual(
+        XCTAssertNil(
             ResetAnnouncementTimeParser.expectedDate(
                 in: "Landing in the next hour or so.",
                 postedAt: postedAt
+            )
+        )
+    }
+
+    func testCentralWithoutMeridiemChoosesNextOccurrenceToday() throws {
+        let postedAt = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-08-29T20:00:00Z"))
+        let expected = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-08-29T21:30:00Z"))
+
+        XCTAssertEqual(
+            ResetAnnouncementTimeParser.expectedDate(
+                in: "There will be one at 4:30 Central.",
+                postedAt: postedAt
             ),
-            postedAt.addingTimeInterval(3_600)
+            expected
         )
     }
 }

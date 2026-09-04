@@ -142,11 +142,38 @@ final class DockingGeometryTests: XCTestCase {
         XCTAssertEqual(bottom.minY, screen.minY)
     }
 
-    func testSideMountsAreModerateHalfCirclesWhileCornersStayQuarterCircles() {
+    func testScaledMountedFramesKeepTheirAnchorAndShape() {
+        let corner = DockingGeometry.mountedFrame(
+            for: .topLeft,
+            in: screen,
+            sideFraction: 0.5,
+            scale: 1.5
+        )
+        XCTAssertEqual(corner.size, NSSize(width: 264, height: 264))
+        XCTAssertEqual(corner.minX, screen.minX)
+        XCTAssertEqual(corner.maxY, screen.maxY)
+
+        let side = DockingGeometry.mountedFrame(
+            for: .right,
+            in: screen,
+            sideFraction: 0.7,
+            scale: 0.8
+        )
+        XCTAssertEqual(side.width, 89.6, accuracy: 0.001)
+        XCTAssertEqual(side.height, 264, accuracy: 0.001)
+        XCTAssertEqual(side.maxX, screen.maxX)
+        XCTAssertEqual(
+            DockingGeometry.sideFraction(for: side, position: .right, in: screen),
+            0.7,
+            accuracy: 0.001
+        )
+    }
+
+    func testSideMountsUseSlenderRailsWhileCornersKeepTheirRadialSize() {
         XCTAssertEqual(DockPosition.topLeft.mountedSize, NSSize(width: 176, height: 176))
-        XCTAssertEqual(DockPosition.left.mountedSize, NSSize(width: 148, height: 280))
-        XCTAssertEqual(DockPosition.right.mountedSize, NSSize(width: 148, height: 280))
-        XCTAssertEqual(DockPosition.top.mountedSize, NSSize(width: 280, height: 148))
+        XCTAssertEqual(DockPosition.left.mountedSize, NSSize(width: 112, height: 330))
+        XCTAssertEqual(DockPosition.right.mountedSize, NSSize(width: 112, height: 330))
+        XCTAssertEqual(DockPosition.top.mountedSize, NSSize(width: 330, height: 112))
     }
 
     func testSideFractionPreservesPlacementAlongAnEdge() {

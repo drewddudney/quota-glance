@@ -9,25 +9,27 @@ enum MobileTheme: String, CaseIterable, Identifiable {
     var calendarColor: Color {
         switch self {
         case .instrument, .oled, .retro: Color(hex: QuotaColors.calendar)
-        case .marine: Color(hex: 0xE3B459)
-        case .radar: Color(hex: 0x82C98E)
-        case .eInk: Color(hex: 0x8C7240)
+        case .marine: Color(hex: 0xF1B84B)
+        case .radar: Color(hex: 0xFFC34D)
+        case .eInk: Color(hex: 0xA85D00)
         }
     }
     var usageColor: Color {
         switch self {
-        case .instrument, .oled, .marine: Color(hex: QuotaColors.usage)
-        case .retro: Color(hex: 0x79F19B)
-        case .radar: Color(hex: 0x58E5A5)
-        case .eInk: Color(hex: 0x557A67)
+        case .instrument, .oled: Color(hex: QuotaColors.usage)
+        case .marine: Color(hex: 0x3B8FEA)
+        case .retro: Color(hex: 0x3182E8)
+        case .radar: Color(hex: 0x2685E5)
+        case .eInk: Color(hex: 0x2868B2)
         }
     }
     var resetColor: Color {
         switch self {
-        case .instrument, .oled, .marine: Color(hex: QuotaColors.reset)
-        case .retro: Color(hex: 0x5CD5FF)
-        case .radar: Color(hex: 0x45BFCB)
-        case .eInk: Color(hex: 0x536A76)
+        case .instrument, .oled: Color(hex: QuotaColors.reset)
+        case .marine: Color(hex: 0x83E2AE)
+        case .retro: Color(hex: 0x63E18A)
+        case .radar: Color(hex: 0x6FE0AC)
+        case .eInk: Color(hex: 0x3A8B62)
         }
     }
     var fontDesign: Font.Design {
@@ -77,8 +79,23 @@ private enum DashboardTab: Hashable { case glance, posts, pace, settings }
 struct DashboardView: View {
     @ObservedObject var store: DashboardStore
     @AppStorage("QuotaGlance.mobile.theme") private var theme: MobileTheme = .instrument
-    @State private var selectedTab: DashboardTab = .glance
+    @State private var selectedTab: DashboardTab = {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--quota-preview-settings") { return .settings }
+        if ProcessInfo.processInfo.arguments.contains("--quota-preview-pace") { return .pace }
+        return .glance
+#else
+        .glance
+#endif
+    }()
     @State private var paceRange: MobilePaceRange = .twelveHours
+    @State private var paceWeekIndex: Int = {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--quota-preview-previous-week") ? 1 : 0
+#else
+        0
+#endif
+    }()
     @State private var postFilterReset = true
 
     private var palette: ThemePalette { theme.palette }
@@ -87,28 +104,36 @@ struct DashboardView: View {
         TabView(selection: $selectedTab) {
             NavigationStack { glancePage }
                 .tag(DashboardTab.glance)
+                .tabItem { Label("Glance", systemImage: "circle.grid.3x3.fill") }
             NavigationStack { postsPage }
                 .tag(DashboardTab.posts)
+                .tabItem { Label("Posts", systemImage: "bubble.left.and.bubble.right") }
             NavigationStack { pacePage }
                 .tag(DashboardTab.pace)
+                .tabItem { Label("Pace", systemImage: "chart.xyaxis.line") }
             NavigationStack {
-                SettingsView(selectedSource: $store.selectedSource, selectedTheme: $theme)
+                SettingsView(store: store, selectedTheme: $theme)
             }
             .tag(DashboardTab.settings)
-        }
-        .toolbar(.hidden, for: .tabBar)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            DashboardTabBar(selection: $selectedTab, theme: theme)
+            .tabItem { Label("Settings", systemImage: "gearshape") }
         }
         .tint(theme.usageColor)
         .preferredColorScheme(palette.isLight ? .light : .dark)
-        .onAppear {
-#if DEBUG
-            let arguments = ProcessInfo.processInfo.arguments
-            if arguments.contains("--quota-tab-posts") { selectedTab = .posts }
-            if arguments.contains("--quota-tab-pace") { selectedTab = .pace }
-            if arguments.contains("--quota-tab-settings") { selectedTab = .settings }
-#endif
+        .alert(
+            "Does this reset apply to your account?",
+            isPresented: Binding(
+                get: { store.snapshot.needsResetApplicabilityAnswer },
+                set: { _ in }
+            )
+        ) {
+            Button("Yes, it applies") {
+                Task { await store.answerResetApplicability(true) }
+            }
+            Button("No, not eligible") {
+                Task { await store.answerResetApplicability(false) }
+            }
+        } message: {
+            Text(store.snapshot.announcementText ?? "This reset has account-specific eligibility requirements.")
         }
     }
 
@@ -119,10 +144,9 @@ struct DashboardView: View {
                 overview
                 if let expectedAt = activeScheduledResetAt { scheduledResetCard(expectedAt) }
                 if let post = store.snapshot.tiboPosts?.first { latestPost(post) }
-                PacePanel(snapshot: store.snapshot, theme: theme, range: $paceRange, compact: true)
+                PacePanel(snapshot: store.snapshot, theme: theme, range: $paceRange, weekIndex: .constant(0), compact: true)
                     .onTapGesture { selectedTab = .pace }
                 detailRows
-                themeRail
             }
             .padding(.horizontal, 14).padding(.bottom, 10)
         }
@@ -146,16 +170,7 @@ struct DashboardView: View {
                 .tracking(-0.7)
                 .foregroundStyle(palette.text)
             Spacer()
-            Menu {
-                    Picker("Theme", selection: $theme) {
-                    ForEach(MobileTheme.allCases) { Text($0.rawValue).tag($0) }
-                }
-            } label: {
-                Label("THEMES", systemImage: "paintpalette")
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(palette.secondary)
-                    .frame(width: 78, alignment: .trailing)
-            }
+            Color.clear.frame(width: 38, height: 38)
         }
         .frame(height: 38)
     }
@@ -180,7 +195,6 @@ struct DashboardView: View {
             Spacer(minLength: 4)
             Text(value.map { "\(Int($0.rounded()))%" } ?? "—")
                 .font(.system(size: 30, weight: .light, design: theme.fontDesign)).monospacedDigit().foregroundStyle(color)
-            Image(systemName: "chevron.right").font(.caption.bold()).foregroundStyle(palette.secondary)
         }
     }
 
@@ -210,43 +224,50 @@ struct DashboardView: View {
     }
 
     private var activeScheduledResetAt: Date? {
-        guard let expectedAt = store.snapshot.announcementExpectedAt,
-              expectedAt > Date().addingTimeInterval(-5 * 60)
-        else { return nil }
-        return expectedAt
+        store.snapshot.activeAnnouncementExpectedAt
     }
 
     private func scheduledResetCard(_ expectedAt: Date) -> some View {
-        TimelineView(.periodic(from: .now, by: 30)) { _ in
+        TimelineView(.periodic(from: .now, by: 30)) { context in
             HStack(spacing: 12) {
-                Image(systemName: "hourglass")
+                Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(theme.resetColor)
+                    .foregroundStyle(Color.black)
                     .frame(width: 34, height: 34)
-                    .background(theme.resetColor.opacity(0.13), in: Circle())
+                    .background(Color.black.opacity(0.12), in: Circle())
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("RESET COUNTDOWN")
+                    Text(expectedAt <= context.date ? "RESET ANNOUNCEMENT ACTIVE" : "CODEX RESET INCOMING")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .tracking(1.1)
-                        .foregroundStyle(theme.resetColor)
-                    Text(expectedAt, style: .timer)
-                        .font(.system(size: 25, weight: .semibold, design: theme.fontDesign))
-                        .monospacedDigit()
-                        .foregroundStyle(palette.text)
+                        .foregroundStyle(Color.black.opacity(0.72))
+                    if expectedAt <= context.date {
+                        Text("AWAITING CONFIRMATION")
+                            .font(.system(size: 18, weight: .semibold, design: theme.fontDesign))
+                            .foregroundStyle(Color.black)
+                    } else {
+                        Text(expectedAt, style: .timer)
+                            .font(.system(size: 25, weight: .semibold, design: theme.fontDesign))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.black)
+                    }
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 3) {
                     Text(expectedAt.formatted(date: .abbreviated, time: .shortened))
                         .font(.system(size: 12, weight: .semibold, design: theme.fontDesign))
-                        .foregroundStyle(palette.text)
+                        .foregroundStyle(Color.black)
                     Text("YOUR TIME · \(Self.timeZoneLabel(expectedAt))")
                         .font(.system(size: 8, weight: .bold, design: .monospaced))
-                        .foregroundStyle(palette.secondary)
+                        .foregroundStyle(Color.black.opacity(0.62))
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .dashboardSurface(palette, radius: theme.cornerRadius)
+            .background(theme.calendarColor, in: RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
+                    .stroke(Color.black.opacity(0.24), lineWidth: 1)
+            }
         }
     }
 
@@ -292,22 +313,6 @@ struct DashboardView: View {
         return "\(Int((store.snapshot.usagePercent ?? 0).rounded()))% · \(duration)"
     }
 
-    private var themeRail: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("THEMES").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(1.4).foregroundStyle(palette.secondary)
-                Spacer(); Text(theme.rawValue).font(.caption.bold()).foregroundStyle(palette.text)
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    ForEach(MobileTheme.allCases) { option in
-                        Button { theme = option } label: { ThemeSwatch(theme: option, selected: option == theme) }.buttonStyle(.plain)
-                    }
-                }
-            }
-        }.padding(.vertical, 2)
-    }
-
     private var postsPage: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
@@ -331,8 +336,10 @@ struct DashboardView: View {
     private var pacePage: some View {
         ScrollView {
             VStack(spacing: 16) {
-                PacePanel(snapshot: store.snapshot, theme: theme, range: $paceRange, compact: false)
-                paceStats; providerSection
+                PacePanel(snapshot: store.snapshot, theme: theme, range: $paceRange, weekIndex: $paceWeekIndex, compact: false)
+                paceStats
+                UsageRhythmPanel(snapshot: store.snapshot, theme: theme)
+                providerSection
             }.padding(16)
         }
         .background(palette.background.ignoresSafeArea()).navigationTitle("Codex Pace").navigationBarTitleDisplayMode(.large)
@@ -340,16 +347,121 @@ struct DashboardView: View {
     }
 
     private var paceStats: some View {
-        HStack(spacing: 0) {
-            paceStat("5M", store.snapshot.tokenPace?.fiveMinutes); paceStat("1H", store.snapshot.tokenPace?.oneHour)
-            paceStat("12H", store.snapshot.tokenPace?.twelveHours); paceStat("24H", store.snapshot.tokenPace?.twentyFourHours)
+        let archives = (store.snapshot.weeklyArchives ?? []).sorted { $0.windowStart > $1.windowStart }
+        let archive = paceWeekIndex > 0 && paceWeekIndex <= archives.count ? archives[paceWeekIndex - 1] : nil
+        return HStack(spacing: 0) {
+            if let archive {
+                paceStatText("TOKENS", archive.totalTokens.map(Self.tokens))
+                paceStatText("API VALUE", archive.apiEquivalentUSD.map { String(format: "$%.2f", $0) })
+                paceStatText("CACHE", archive.cacheHitRate.map { "\(Int(($0 * 100).rounded()))%" })
+                paceStatText("FAST", archive.fastShare.map { "\(Int(($0 * 100).rounded()))%" })
+            } else {
+                paceStat("5M", tokenBurn(store.snapshot.tokenPace?.fiveMinutes, over: 5 * 60))
+                paceStat("1H", tokenBurn(store.snapshot.tokenPace?.oneHour, over: 60 * 60))
+                paceStat("12H", tokenBurn(store.snapshot.tokenPace?.twelveHours, over: 12 * 60 * 60))
+                paceStat("24H", tokenBurn(store.snapshot.tokenPace?.twentyFourHours, over: 24 * 60 * 60))
+            }
         }.padding(.vertical, 15).dashboardSurface(palette)
     }
+    private func tokenBurn(_ reported: Int64?, over interval: TimeInterval) -> Int64? {
+        let derived = store.snapshot.tokenBurnSample(over: interval)?.tokens
+        return [reported, derived].compactMap { $0 }.max()
+    }
     private func paceStat(_ label: String, _ tokens: Int64?) -> some View {
+        paceStatText(label, tokens.map(Self.tokens))
+    }
+    private func paceStatText(_ label: String, _ value: String?) -> some View {
         VStack(spacing: 5) {
             Text(label).font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
-            Text(tokens.map(Self.tokens) ?? "—").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundStyle(palette.text).minimumScaleFactor(0.7)
+            Text(value ?? "—").font(.system(size: 13, weight: .bold, design: .rounded)).foregroundStyle(palette.text).minimumScaleFactor(0.7)
         }.frame(maxWidth: .infinity)
+    }
+
+    private func archivedWeeks(_ archives: [QuotaWeeklyArchive]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("PREVIOUS WEEKS", systemImage: "clock.arrow.circlepath")
+                Spacer()
+                Text("HOURLY · \(archives.count) SAVED")
+            }
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundStyle(palette.secondary)
+
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 12) {
+                    ForEach(archives) { archive in
+                        MobileArchivedWeekCard(archive: archive, theme: theme)
+                            .containerRelativeFrame(.horizontal, count: 1, spacing: 12)
+                    }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollTargetBehavior(.viewAligned)
+            .scrollIndicators(.hidden)
+        }
+    }
+
+    private var usageIntelligenceCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("USAGE INTELLIGENCE", systemImage: "gauge.with.dots.needle.50percent")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .tracking(1.1)
+                    .foregroundStyle(palette.secondary)
+                Spacer()
+                if let coverage = store.snapshot.usageIntelligence?.pricingCoverage {
+                    Text("\(Int((coverage * 100).rounded()))% PRICED")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(coverage >= 0.8 ? theme.usageColor : theme.calendarColor)
+                }
+            }
+
+            if let intelligence = store.snapshot.usageIntelligence {
+                HStack(spacing: 0) {
+                    intelligenceMetric("API VALUE", String(format: "$%.2f", intelligence.apiEquivalentUSD))
+                    intelligenceMetric("QUOTA VALUE", String(format: "$%.2f", intelligence.quotaWeightedUSD))
+                    intelligenceMetric("FAST", "\(Int((intelligence.fastShare * 100).rounded()))%")
+                }
+                Text("\(intelligence.topModel ?? "Unknown model") · \(intelligence.eventCount.formatted()) metered events · speed confidence \(Int((intelligence.speedCoverage * 100).rounded()))%")
+                    .font(.system(size: 10, design: theme.fontDesign))
+                    .foregroundStyle(palette.secondary)
+            }
+
+            if let secondary = store.snapshot.secondaryQuota {
+                Divider().overlay(palette.grid)
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle().stroke(palette.grid, lineWidth: 4)
+                        Circle()
+                            .trim(from: 0, to: max(0, min(1, secondary.usedPercent / 100)))
+                            .stroke(theme.resetColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                        Text("\(Int(secondary.usedPercent.rounded()))%")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                    }
+                    .frame(width: 44, height: 44)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("SECONDARY WINDOW")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(theme.resetColor)
+                        Text("Resets \(secondary.resetAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.system(size: 12, weight: .semibold, design: theme.fontDesign))
+                            .foregroundStyle(palette.text)
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .padding(16)
+        .dashboardSurface(palette)
+    }
+
+    private func intelligenceMetric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
+            Text(value).font(.system(size: 18, weight: .semibold, design: theme.fontDesign)).foregroundStyle(palette.text)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var providerSection: some View {
@@ -358,8 +470,14 @@ struct DashboardView: View {
                 Text("RESET SOURCES").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(1.2).foregroundStyle(palette.secondary)
                 Spacer()
                 Menu {
-                    Picker("Reset calculator", selection: $store.selectedSource) { ForEach(ResetSource.allCases) { Text($0.name).tag($0) } }
-                } label: { Text(store.selectedSource.name).font(.caption.bold()).foregroundStyle(Color(hex: QuotaColors.reset)) }
+                    ForEach(ResetSource.calculatorCases) { source in
+                        Toggle(source.name, isOn: store.binding(for: source))
+                    }
+                } label: {
+                    Text(ResetSource.selectionLabel(store.selectedSources))
+                        .font(.caption.bold())
+                        .foregroundStyle(Color(hex: QuotaColors.reset))
+                }
             }
             ForEach(store.snapshot.providers) { provider in
                 HStack {
@@ -375,6 +493,7 @@ struct DashboardView: View {
         switch store.state { case .current: Color(hex: QuotaColors.usage); case .syncing: Color(hex: QuotaColors.calendar); case .idle, .partial: palette.secondary }
     }
     fileprivate static func tokens(_ value: Int64) -> String {
+        if value >= 1_000_000_000 { return String(format: "%.2fB", Double(value) / 1_000_000_000) }
         if value >= 1_000_000 { return String(format: "%.1fM", Double(value) / 1_000_000) }
         if value >= 1_000 { return String(format: "%.0fK", Double(value) / 1_000) }
         return "\(value)"
@@ -487,28 +606,168 @@ private struct ActivityRingCluster: View {
     }
 }
 
+private struct MobileAllowancePanel: View {
+    let snapshot: QuotaSnapshot
+    let theme: MobileTheme
+    private var palette: ThemePalette { theme.palette }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("ALLOWANCES", systemImage: "gauge.with.dots.needle.67percent")
+                Spacer()
+                if let credits = snapshot.creditSummary {
+                    Text(credits.unlimited ? "UNLIMITED" : credits.balance ?? (credits.hasCredits ? "CREDITS" : "NO CREDITS"))
+                }
+            }
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundStyle(palette.secondary)
+
+            ForEach(snapshot.quotaInventory ?? []) { window in
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(window.label).font(.system(size: 13, weight: .semibold, design: theme.fontDesign)).foregroundStyle(palette.text)
+                            Text(window.scope + " · " + window.resetAt.formatted(.relative(presentation: .named)))
+                                .font(.system(size: 9, weight: .medium, design: .rounded)).foregroundStyle(palette.secondary)
+                        }
+                        Spacer()
+                        Text("\(Int(window.usedPercent.rounded()))%")
+                            .font(.system(size: 17, weight: .semibold, design: theme.fontDesign)).foregroundStyle(theme.usageColor)
+                    }
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(palette.grid)
+                            Capsule().fill(theme.usageColor)
+                                .frame(width: geometry.size.width * max(0, min(1, window.usedPercent / 100)))
+                        }
+                    }.frame(height: 5)
+                }
+            }
+
+            if let task = snapshot.activeTasks?.first {
+                Divider().overlay(palette.grid)
+                HStack(spacing: 9) {
+                    Circle().fill(theme.usageColor).frame(width: 7, height: 7)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(task.name).font(.system(size: 12, weight: .semibold, design: theme.fontDesign)).foregroundStyle(palette.text).lineLimit(1)
+                        Text(task.state.uppercased()).font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
+                    }
+                    Spacer()
+                    Text(task.updatedAt, style: .relative).font(.caption2).foregroundStyle(palette.secondary)
+                }
+            }
+        }
+        .padding(16)
+        .dashboardSurface(palette)
+    }
+}
+
+private struct UsageRhythmPanel: View {
+    private struct Cell: Identifiable { let date: Date; let burn: Double; var id: Date { date } }
+    let snapshot: QuotaSnapshot
+    let theme: MobileTheme
+    private var palette: ThemePalette { theme.palette }
+
+    private var cells: [Cell] {
+        let calendar = Calendar.current
+        var output: [Cell] = []
+        for archive in snapshot.weeklyArchives ?? [] {
+            let values = [(archive.windowStart, 0.0)] + archive.points.map { ($0.date, $0.usedPercent) }
+            var first: [Date: Double] = [:], last: [Date: Double] = [:]
+            for (date, value) in values.sorted(by: { $0.0 < $1.0 }) {
+                let day = calendar.startOfDay(for: date)
+                if first[day] == nil { first[day] = value }
+                last[day] = value
+            }
+            output += last.map { Cell(date: $0.key, burn: max(0, $0.value - (first[$0.key] ?? $0.value))) }
+        }
+        if let start = snapshot.usageWindowStart {
+            let values = [(start, 0.0)] + (snapshot.usageHistory ?? []).map { ($0.date, $0.usedPercent) }
+            var first: [Date: Double] = [:], last: [Date: Double] = [:]
+            for (date, value) in values.sorted(by: { $0.0 < $1.0 }) {
+                let day = calendar.startOfDay(for: date)
+                if first[day] == nil { first[day] = value }
+                last[day] = value
+            }
+            output += last.map { Cell(date: $0.key, burn: max(0, $0.value - (first[$0.key] ?? $0.value))) }
+        }
+        var merged: [Date: Double] = [:]
+        for cell in output { merged[cell.date] = max(merged[cell.date] ?? 0, cell.burn) }
+        return merged.map { Cell(date: $0.key, burn: $0.value) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("USAGE RHYTHM", systemImage: "square.grid.3x3.fill")
+                Spacer()
+                Text("26 WEEKS")
+            }.font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
+
+            Canvas { context, size in
+                let calendar = Calendar.current
+                let end = calendar.startOfDay(for: Date())
+                let start = calendar.date(byAdding: .day, value: -(26 * 7 - 1), to: end) ?? end
+                let gap: CGFloat = 3
+                let side = min(11, (size.width - 25 * gap) / 26)
+                let lookup = Dictionary(uniqueKeysWithValues: cells.map { (calendar.startOfDay(for: $0.date), $0.burn) })
+                let peak = max(1, cells.map(\.burn).max() ?? 1)
+                for offset in 0..<(26 * 7) {
+                    guard let date = calendar.date(byAdding: .day, value: offset, to: start) else { continue }
+                    let row = (calendar.component(.weekday, from: date) + 5) % 7
+                    let column = offset / 7
+                    let intensity = min(1, (lookup[date] ?? 0) / peak)
+                    let rect = CGRect(x: CGFloat(column) * (side + gap), y: CGFloat(row) * (side + gap), width: side, height: side)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(intensity > 0 ? theme.usageColor.opacity(0.18 + intensity * 0.82) : palette.grid.opacity(0.7)))
+                }
+            }.frame(height: 7 * 14)
+
+            HStack {
+                Text("\(cells.filter { $0.burn > 0.05 }.count) active days")
+                Spacer()
+                Text(cells.max(by: { $0.burn < $1.burn }).map { "Peak \(Int($0.burn.rounded()))%" } ?? "Building history")
+            }.font(.system(size: 9, weight: .semibold, design: .rounded)).foregroundStyle(palette.secondary)
+        }
+        .padding(16)
+        .dashboardSurface(palette)
+    }
+}
+
 private struct PacePanel: View {
     let snapshot: QuotaSnapshot
     let theme: MobileTheme
     @Binding var range: MobilePaceRange
+    @Binding var weekIndex: Int
     let compact: Bool
     @State private var selectedDate: Date?
     private var palette: ThemePalette { theme.palette }
+    private var archives: [QuotaWeeklyArchive] {
+        (snapshot.weeklyArchives ?? []).sorted { $0.windowStart > $1.windowStart }
+    }
+    private var selectedArchive: QuotaWeeklyArchive? {
+        guard !compact, weekIndex > 0, weekIndex <= archives.count else { return nil }
+        return archives[weekIndex - 1]
+    }
+    private var currentPoints: [QuotaUsagePoint] {
+        QuotaChartHistory.currentPoints(from: snapshot)
+    }
+    private var archivePoints: [QuotaUsagePoint] {
+        guard let archive = selectedArchive else { return [] }
+        let start = QuotaUsagePoint(date: archive.windowStart, usedPercent: 0, tokens: 0)
+        let converted = archive.points.map { point in
+            let tokens = archive.totalTokens.flatMap { total -> Int64? in
+                guard archive.finalUsedPercent > 0 else { return nil }
+                return Int64((Double(total) * point.usedPercent / archive.finalUsedPercent).rounded())
+            }
+            return QuotaUsagePoint(date: point.date, usedPercent: point.usedPercent, tokens: tokens)
+        }
+        return [start] + converted
+    }
     private var points: [QuotaUsagePoint] {
-        var all = (snapshot.usageHistory ?? []).sorted { $0.date < $1.date }
+        if selectedArchive != nil { return archivePoints }
+        let all = currentPoints
         let now = Date()
-        if let current = snapshot.usagePercent, all.last.map({ now.timeIntervalSince($0.date) > 30 }) ?? true {
-            all.append(.init(date: now, usedPercent: current, tokens: snapshot.weeklyTokens))
-        }
-        let reportedTokens = snapshot.weeklyTokens ?? 0
-        let tokenAnchor = reportedTokens > 0 ? reportedTokens : (all.compactMap(\.tokens).max() ?? 0)
-        all = all.map { point in
-            guard let tokenAtPoint = point.tokens,
-                  tokenAnchor > 0,
-                  let currentPercent = snapshot.usagePercent, currentPercent > 0 else { return point }
-            let tokenInterpolated = Double(tokenAtPoint) / Double(tokenAnchor) * currentPercent
-            return .init(date: point.date, usedPercent: max(point.usedPercent, min(currentPercent, tokenInterpolated)), tokens: tokenAtPoint)
-        }
         guard let seconds = range.seconds else { return all }
         let cutoff = now.addingTimeInterval(-seconds), inside = all.filter { $0.date >= cutoff }
         if let previous = all.last(where: { $0.date < cutoff }) {
@@ -516,11 +775,20 @@ private struct PacePanel: View {
         }
         return inside
     }
-    private var visibleStart: Date { points.first?.date ?? snapshot.usageWindowStart ?? Date().addingTimeInterval(-3_600) }
-    private var visibleEnd: Date { points.last?.date ?? Date() }
+    private var activeWindowStart: Date? { selectedArchive?.windowStart ?? snapshot.usageWindowStart }
+    private var activeResetAt: Date? { selectedArchive?.resetAt ?? snapshot.resetAt }
+    private var activeUsedPercent: Double? { selectedArchive?.finalUsedPercent ?? snapshot.usagePercent }
+    private var activeTokenTotal: Int64? { selectedArchive?.totalTokens ?? snapshot.bestTokenTotal }
+    private var visibleStart: Date {
+        points.first?.date ?? activeWindowStart ?? Date().addingTimeInterval(-(range.seconds ?? 3_600))
+    }
+    private var visibleEnd: Date {
+        let candidate = points.last?.date ?? Date()
+        return candidate > visibleStart ? candidate : visibleStart.addingTimeInterval(60)
+    }
     private func graphValue(_ point: QuotaUsagePoint) -> Double { point.usedPercent }
     private func idealPercent(at date: Date) -> Double {
-        guard let start = snapshot.usageWindowStart, let reset = snapshot.resetAt, reset > start else { return 0 }
+        guard let start = activeWindowStart, let reset = activeResetAt, reset > start else { return 0 }
         return max(0, min(100, date.timeIntervalSince(start) / reset.timeIntervalSince(start) * 100))
     }
     private func idealValue(at date: Date) -> Double { idealPercent(at: date) }
@@ -528,31 +796,169 @@ private struct PacePanel: View {
         guard let selectedDate else { return nil }
         return points.min { abs($0.date.timeIntervalSince(selectedDate)) < abs($1.date.timeIntervalSince(selectedDate)) }
     }
+    private var costPoints: [QuotaCostPoint] {
+        guard selectedArchive == nil else { return [] }
+        let all = (snapshot.usageIntelligence?.costTimeline ?? []).sorted { $0.date < $1.date }
+        guard let seconds = range.seconds else { return all }
+        let cutoff = Date().addingTimeInterval(-seconds)
+        let inside = all.filter { $0.date >= cutoff }
+        if let previous = all.last(where: { $0.date < cutoff }) {
+            return [.init(date: cutoff, apiEquivalentUSD: previous.apiEquivalentUSD)] + inside
+        }
+        return inside
+    }
+    private func normalizedCost(_ point: QuotaCostPoint) -> Double {
+        guard let intelligence = snapshot.usageIntelligence,
+              intelligence.apiEquivalentUSD > 0,
+              let used = activeUsedPercent else { return 0 }
+        return max(0, min(100, point.apiEquivalentUSD / intelligence.apiEquivalentUSD * used))
+    }
+    private var nearestCost: QuotaCostPoint? {
+        guard let selectedDate else { return nil }
+        return costPoints.min { abs($0.date.timeIntervalSince(selectedDate)) < abs($1.date.timeIntervalSince(selectedDate)) }
+    }
+    private var yDomain: ClosedRange<Double> {
+        let values = points.map(\.usedPercent)
+            + costPoints.map(normalizedCost)
+            + [idealPercent(at: visibleStart), idealPercent(at: visibleEnd)]
+        guard let minimum = values.min(), let maximum = values.max() else { return 0...10 }
+        let span = max(5, maximum - minimum)
+        var lower = floor(max(0, minimum - span * 0.18) / 5) * 5
+        var upper = ceil(min(100, maximum + span * 0.18) / 5) * 5
+        if upper - lower < 10 {
+            lower = max(0, lower - 5)
+            upper = min(100, upper + 5)
+        }
+        return lower...max(lower + 5, upper)
+    }
+    private var xAxisDates: [Date] {
+        let duration = visibleEnd.timeIntervalSince(visibleStart)
+        guard duration > 0 else { return [visibleStart] }
+        // Keep labels comfortably inside the plot. Axis labels at the exact
+        // trailing boundary are truncated by Swift Charts on narrow phones.
+        let fractions: [Double] = compact ? [0.14, 0.50, 0.82] : [0.10, 0.35, 0.60, 0.84]
+        return fractions.map { visibleStart.addingTimeInterval(duration * $0) }
+    }
+    private var projectedRunoutAt: Date? {
+        guard selectedArchive == nil,
+              let used = snapshot.usagePercent,
+              used > 0, used < 100,
+              let latest = points.last,
+              let first = points.first,
+              latest.date > first.date
+        else { return selectedArchive == nil ? snapshot.estimatedRunoutAt : nil }
+
+        let duration = latest.date.timeIntervalSince(first.date)
+        var percentBurn = latest.usedPercent - first.usedPercent
+        if percentBurn <= 0,
+           let firstTokens = first.tokens,
+           let lastTokens = latest.tokens,
+           lastTokens > firstTokens,
+           let total = activeTokenTotal,
+           total > 0 {
+            percentBurn = Double(lastTokens - firstTokens) / Double(total) * used
+        }
+        guard percentBurn > 0 else { return snapshot.estimatedRunoutAt }
+        let seconds = (100 - used) / (percentBurn / duration)
+        guard seconds.isFinite, seconds > 0 else { return snapshot.estimatedRunoutAt }
+        return latest.date.addingTimeInterval(seconds)
+    }
+    private var weekLabel: String {
+        guard let archive = selectedArchive else { return "THIS WEEK" }
+        return archive.windowStart.formatted(.dateTime.month(.abbreviated).day())
+            + " – " + archive.resetAt.formatted(.dateTime.month(.abbreviated).day())
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
+            if !compact {
+                HStack {
+                    Button {
+                        guard weekIndex < archives.count else { return }
+                        weekIndex += 1
+                        selectedDate = nil
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .frame(width: 34, height: 30)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(weekIndex >= archives.count)
+                    .opacity(weekIndex >= archives.count ? 0.22 : 1)
+
+                    Spacer()
+                    Text(weekLabel.uppercased())
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .tracking(1.1)
+                        .foregroundStyle(palette.secondary)
+                    Spacer()
+
+                    Button {
+                        guard weekIndex > 0 else { return }
+                        weekIndex -= 1
+                        selectedDate = nil
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .frame(width: 34, height: 30)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(weekIndex == 0)
+                    .opacity(weekIndex == 0 ? 0.22 : 1)
+                }
+                .foregroundStyle(theme.usageColor)
+            }
             HStack(alignment: .center) {
                 Label("PACE", systemImage: "chart.xyaxis.line")
                     .font(.system(size: compact ? 12 : 14, weight: .bold, design: .rounded))
                     .foregroundStyle(palette.secondary)
                 Spacer()
-                if let runout = snapshot.estimatedRunoutAt {
+                if let runout = projectedRunoutAt {
                     Text("Run-out in").font(.system(size: 11, design: .rounded)).foregroundStyle(palette.secondary)
                     Text(Self.relative(runout)).font(.system(size: 16, weight: .semibold, design: theme.fontDesign)).foregroundStyle(theme.usageColor)
+                } else if let archive = selectedArchive {
+                    Text("Finished").font(.system(size: 11, design: .rounded)).foregroundStyle(palette.secondary)
+                    Text("\(Int(archive.finalUsedPercent.rounded()))%")
+                        .font(.system(size: 16, weight: .semibold, design: theme.fontDesign))
+                        .foregroundStyle(theme.usageColor)
+                } else {
+                    Text("Calculating pace")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(palette.secondary)
                 }
             }
-            HStack(spacing: 6) {
-                ForEach(MobilePaceRange.allCases) { option in
-                    Button { range = option; selectedDate = nil } label: {
-                        Text(option.rawValue).font(.system(size: 9, weight: .medium, design: .rounded)).frame(maxWidth: .infinity).padding(.vertical, 6)
-                            .background(range == option ? theme.usageColor : palette.raised, in: theme == .retro || theme == .eInk ? AnyShape(RoundedRectangle(cornerRadius: 3)) : AnyShape(Capsule()))
-                            .foregroundStyle(range == option ? (palette.isLight ? Color.white : Color.black) : palette.secondary)
-                    }.buttonStyle(.plain)
+            if selectedArchive == nil {
+                HStack(spacing: 6) {
+                    ForEach(MobilePaceRange.allCases) { option in
+                        Button { range = option; selectedDate = nil } label: {
+                            Text(option.rawValue).font(.system(size: 9, weight: .medium, design: .rounded)).frame(maxWidth: .infinity).padding(.vertical, 6)
+                                .background(range == option ? theme.usageColor : palette.raised, in: theme == .retro || theme == .eInk ? AnyShape(RoundedRectangle(cornerRadius: 3)) : AnyShape(Capsule()))
+                                .foregroundStyle(range == option ? Color.white : palette.secondary)
+                        }.buttonStyle(.plain)
+                    }
                 }
+            }
+            if !compact, selectedArchive == nil, let intelligence = snapshot.usageIntelligence {
+                HStack(alignment: .bottom, spacing: 0) {
+                    intelligenceValue("API VALUE", String(format: "$%.2f", intelligence.apiEquivalentUSD), theme.resetColor)
+                    intelligenceValue("TOKENS", snapshot.bestTokenTotal.map(DashboardView.tokens) ?? "—", palette.text)
+                    intelligenceValue("CACHE", intelligence.cacheHitRate.map { "\(Int(($0 * 100).rounded()))%" } ?? "—", palette.text)
+                    intelligenceValue("FAST", "\(Int((intelligence.fastShare * 100).rounded()))%", palette.text)
+                }
+                HStack(spacing: 7) {
+                    Text(intelligence.topModel?.replacingOccurrences(of: "gpt-", with: "") ?? "Unknown model")
+                    Circle().frame(width: 2, height: 2)
+                    Text("\(Int((intelligence.pricingCoverage * 100).rounded()))% priced")
+                    if let secondary = snapshot.secondaryQuota {
+                        Circle().frame(width: 2, height: 2)
+                        Text("secondary \(Int(secondary.usedPercent.rounded()))%")
+                    }
+                }
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundStyle(palette.secondary)
             }
             if let point = nearestPoint {
                 HStack {
                     Text(point.date.formatted(date: .omitted, time: .shortened)); Spacer(); Text("\(Int(point.usedPercent.rounded()))%")
                     if let tokens = point.tokens { Text("· \(DashboardView.tokens(tokens)) tokens") }
+                    if let cost = nearestCost { Text("· \(cost.apiEquivalentUSD, format: .currency(code: "USD"))") }
                 }.font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(palette.text)
                     .padding(.horizontal, 10).padding(.vertical, 7).background(palette.raised, in: Capsule())
             }
@@ -564,7 +970,12 @@ private struct PacePanel: View {
                     AreaMark(x: .value("Time", point.date), y: .value("Used", graphValue(point)), series: .value("Series", "Actual fill"))
                         .foregroundStyle(LinearGradient(colors: [theme.usageColor.opacity(theme == .eInk ? 0.05 : 0.18), .clear], startPoint: .top, endPoint: .bottom))
                 }
-                if snapshot.usageWindowStart != nil, snapshot.resetAt != nil {
+                ForEach(costPoints) { point in
+                    LineMark(x: .value("Time", point.date), y: .value("API cost", normalizedCost(point)), series: .value("Series", "API cost"))
+                        .foregroundStyle(theme.resetColor)
+                        .lineStyle(StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+                }
+                if activeWindowStart != nil, activeResetAt != nil {
                     LineMark(x: .value("Time", visibleStart), y: .value("Ideal", idealValue(at: visibleStart)), series: .value("Series", "Ideal")).foregroundStyle(palette.secondary).lineStyle(StrokeStyle(lineWidth: 1.2, dash: [3, 4]))
                     LineMark(x: .value("Time", visibleEnd), y: .value("Ideal", idealValue(at: visibleEnd)), series: .value("Series", "Ideal")).foregroundStyle(palette.secondary).lineStyle(StrokeStyle(lineWidth: 1.2, dash: [3, 4]))
                 }
@@ -573,7 +984,8 @@ private struct PacePanel: View {
                     PointMark(x: .value("Selected", point.date), y: .value("Used", graphValue(point))).foregroundStyle(theme.usageColor).symbolSize(38)
                 }
             }
-            .chartYScale(domain: 0...100)
+            .chartXScale(domain: visibleStart...visibleEnd)
+            .chartYScale(domain: yDomain)
             .chartYAxis {
                 AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
                     AxisGridLine().foregroundStyle(palette.grid.opacity(0.75))
@@ -583,8 +995,14 @@ private struct PacePanel: View {
                 }
             }
             .chartXAxis {
-                AxisMarks(values: .automatic(desiredCount: compact ? 3 : 5)) {
-                    AxisGridLine().foregroundStyle(palette.grid.opacity(0.35)); AxisValueLabel(format: .dateTime.hour().minute()).foregroundStyle(palette.secondary)
+                AxisMarks(values: xAxisDates) { value in
+                    AxisGridLine().foregroundStyle(palette.grid.opacity(0.35))
+                    AxisValueLabel {
+                        if let date = value.as(Date.self) {
+                            Text(axisLabel(date))
+                        }
+                    }
+                    .foregroundStyle(palette.secondary)
                 }
             }
             .chartOverlay { proxy in
@@ -598,10 +1016,18 @@ private struct PacePanel: View {
             .frame(height: compact ? 102 : 270)
             HStack {
                 Label("USAGE PATH", systemImage: "line.diagonal").foregroundStyle(theme.usageColor)
+                if !costPoints.isEmpty { Label("API COST", systemImage: "line.diagonal").foregroundStyle(theme.resetColor) }
                 Label("IDEAL", systemImage: "line.diagonal").foregroundStyle(palette.secondary); Spacer()
-                if let used = snapshot.usagePercent { Text("\(Int(used.rounded()))% USED") }
+                if let used = activeUsedPercent { Text("\(Int(used.rounded()))% USED") }
             }.font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
         }.padding(compact ? 8 : 16).dashboardSurface(palette, radius: compact ? theme.cornerRadius : theme.cornerRadius + 2)
+    }
+    private func intelligenceValue(_ label: String, _ value: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.system(size: 7, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
+            Text(value).font(.system(size: 14, weight: .semibold, design: theme.fontDesign)).foregroundStyle(color).lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
     private var paceHeadline: String {
         guard let runout = snapshot.estimatedRunoutAt, let reset = snapshot.resetAt else { return "Building your pace" }
@@ -611,6 +1037,86 @@ private struct PacePanel: View {
         let seconds = max(0, date.timeIntervalSinceNow), days = Int(seconds / 86_400)
         let hours = Int(seconds.truncatingRemainder(dividingBy: 86_400) / 3_600), minutes = Int(seconds.truncatingRemainder(dividingBy: 3_600) / 60)
         if days > 0 { return "\(days)d \(hours)h" }; if hours > 0 { return "\(hours)h \(minutes)m" }; return "\(minutes)m"
+    }
+    private func axisLabel(_ date: Date) -> String {
+        if selectedArchive != nil || visibleEnd.timeIntervalSince(visibleStart) > 36 * 3_600 {
+            return date.formatted(.dateTime.weekday(.abbreviated))
+        }
+        return date.formatted(.dateTime.hour())
+    }
+}
+
+private struct MobileArchivedWeekCard: View {
+    let archive: QuotaWeeklyArchive
+    let theme: MobileTheme
+    private var palette: ThemePalette { theme.palette }
+    private var values: [QuotaWeeklyArchivePoint] {
+        [.init(date: archive.windowStart, usedPercent: 0, apiEquivalentUSD: 0)] + archive.points
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(dateRange).font(.system(size: 15, weight: .semibold, design: theme.fontDesign)).foregroundStyle(palette.text)
+                    Text("COMPLETED WEEK").font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
+                }
+                Spacer()
+                Text("\(Int(archive.finalUsedPercent.rounded()))%")
+                    .font(.system(size: 24, weight: .semibold, design: theme.fontDesign))
+                    .foregroundStyle(theme.usageColor)
+            }
+
+            HStack(spacing: 0) {
+                metric("API", archive.apiEquivalentUSD.map { String(format: "$%.0f", $0) } ?? "—")
+                metric("TOKENS", archive.totalTokens.map(DashboardView.tokens) ?? "—")
+                metric("CACHE", archive.cacheHitRate.map { "\(Int(($0 * 100).rounded()))%" } ?? "—")
+                metric("FAST", archive.fastShare.map { "\(Int(($0 * 100).rounded()))%" } ?? "—")
+            }
+
+            Chart {
+                ForEach(values) { point in
+                    LineMark(x: .value("Time", point.date), y: .value("Used", point.usedPercent))
+                        .foregroundStyle(theme.usageColor)
+                        .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    AreaMark(x: .value("Time", point.date), y: .value("Used", point.usedPercent))
+                        .foregroundStyle(LinearGradient(colors: [theme.usageColor.opacity(0.15), .clear], startPoint: .top, endPoint: .bottom))
+                }
+                LineMark(x: .value("Time", archive.windowStart), y: .value("Ideal", 0), series: .value("Series", "Ideal"))
+                    .foregroundStyle(palette.secondary).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 4]))
+                LineMark(x: .value("Time", archive.resetAt), y: .value("Ideal", 100), series: .value("Series", "Ideal"))
+                    .foregroundStyle(palette.secondary).lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 4]))
+            }
+            .chartYScale(domain: 0...100)
+            .chartXAxis(.hidden)
+            .chartYAxis {
+                AxisMarks(values: [0, 50, 100]) { value in
+                    AxisGridLine().foregroundStyle(palette.grid)
+                    AxisValueLabel { if let n = value.as(Int.self) { Text("\(n)%") } }.foregroundStyle(palette.secondary)
+                }
+            }
+            .frame(height: 150)
+
+            if let model = archive.topModel {
+                Text(model.replacingOccurrences(of: "gpt-", with: ""))
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(palette.secondary)
+            }
+        }
+        .padding(16)
+        .dashboardSurface(palette)
+    }
+
+    private var dateRange: String {
+        archive.windowStart.formatted(.dateTime.month(.abbreviated).day()) + " – " + archive.resetAt.formatted(.dateTime.month(.abbreviated).day())
+    }
+
+    private func metric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.system(size: 7, weight: .bold, design: .monospaced)).foregroundStyle(palette.secondary)
+            Text(value).font(.system(size: 12, weight: .semibold, design: theme.fontDesign)).foregroundStyle(palette.text).lineLimit(1).minimumScaleFactor(0.65)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -689,37 +1195,6 @@ private struct ThemeSwatch: View {
                     .foregroundStyle(Color(hex: 0x353636))
             )
         }
-    }
-}
-
-private struct DashboardTabBar: View {
-    @Binding var selection: DashboardTab
-    let theme: MobileTheme
-    private var palette: ThemePalette { theme.palette }
-    private let items: [(DashboardTab, String, String)] = [
-        (.glance, "circle.grid.3x3.fill", "Glance"),
-        (.posts, "bubble.left.and.bubble.right", "Posts"),
-        (.pace, "chart.xyaxis.line", "Pace"),
-        (.settings, "gearshape", "Settings")
-    ]
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ForEach(items, id: \.0) { tab, icon, label in
-                Button { selection = tab } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: icon).font(.system(size: 20, weight: .medium))
-                        Text(label).font(.system(size: 10, weight: .medium, design: .rounded))
-                    }
-                    .foregroundStyle(selection == tab ? theme.usageColor : palette.secondary)
-                    .frame(maxWidth: .infinity).frame(height: 44)
-                    .contentShape(Rectangle())
-                }.buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 8)
-        .background(palette.background.opacity(0.97))
-        .overlay(alignment: .top) { Rectangle().fill(palette.grid.opacity(0.6)).frame(height: 0.5) }
     }
 }
 

@@ -1,6 +1,7 @@
 import AppKit
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 
 @main
@@ -24,12 +25,40 @@ struct QuotaGlanceApp: App {
                     model.refresh()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceResetCalculatorChanged)) { notification in
-                    if let rawValue = notification.object as? String {
-                        model.selectForecastSource(rawValue)
+                    if let rawValues = notification.object as? [String] {
+                        model.selectForecastSources(rawValues)
                     }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceBillingUpdated)) { _ in
                     model.publishMobileSnapshot()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceMenuInteraction)) { _ in
+                    model.noteMenuInteraction()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .quotaGlancePrivateLiveFeedTest)) { _ in
+                    model.publishMobileSnapshot()
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: NSUbiquitousKeyValueStore.didChangeExternallyNotification
+                    )
+                ) { notification in
+                    let keys = notification.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
+                    if keys == nil || keys?.contains(ResetApplicability.cloudKey) == true {
+                        model.syncResetApplicabilityFromCloud()
+                    }
+                }
+                .alert(
+                    "Does this reset apply to your account?",
+                    isPresented: Binding(
+                        get: { model.resetApplicabilityQuestion != nil },
+                        set: { _ in }
+                    )
+                ) {
+                    Button("Yes, it applies") { model.answerResetApplicability(true) }
+                    Button("No, not eligible") { model.answerResetApplicability(false) }
+                } message: {
+                    Text(model.resetApplicabilityQuestion?.text ?? "This reset has account-specific eligibility requirements.")
                 }
         }
         .defaultSize(width: 680, height: 230)
@@ -46,6 +75,10 @@ extension Notification.Name {
     static let quotaGlanceResetCalculatorChanged = Notification.Name("QuotaGlance.resetCalculatorChanged")
     static let quotaGlanceBillingUpdated = Notification.Name("QuotaGlance.billingUpdated")
     static let quotaGlanceDockChanged = Notification.Name("QuotaGlance.dockChanged")
+    static let quotaGlanceMenuInteraction = Notification.Name("QuotaGlance.menuInteraction")
+    static let quotaGlanceMenuBarSummaryChanged = Notification.Name("QuotaGlance.menuBarSummaryChanged")
+    static let quotaGlanceShowTweets = Notification.Name("QuotaGlance.showTweets")
+    static let quotaGlancePrivateLiveFeedTest = Notification.Name("QuotaGlance.privateLiveFeedTest")
 }
 
 enum DockPosition: String, CaseIterable, Sendable {
@@ -75,12 +108,10 @@ enum DockPosition: String, CaseIterable, Sendable {
         switch self {
         case .topLeft, .topRight, .bottomLeft, .bottomRight:
             return NSSize(width: 176, height: 176)
-        case .left, .right, .top, .bottom:
-            switch self {
-            case .left, .right: return NSSize(width: 148, height: 280)
-            case .top, .bottom: return NSSize(width: 280, height: 148)
-            default: return .zero
-            }
+        case .left, .right:
+            return NSSize(width: 112, height: 330)
+        case .top, .bottom:
+            return NSSize(width: 330, height: 112)
         case .floating:
             return .zero
         }
@@ -132,10 +163,12 @@ enum DockingGeometry {
     static func mountedFrame(
         for position: DockPosition,
         in visibleFrame: NSRect,
-        sideFraction: CGFloat
+        sideFraction: CGFloat,
+        scale: CGFloat = 1
     ) -> NSRect {
         guard position.isMounted else { return .zero }
-        let size = position.mountedSize
+        let baseSize = position.mountedSize
+        let size = NSSize(width: baseSize.width * scale, height: baseSize.height * scale)
         let fraction = max(0, min(1, sideFraction))
         let sideX = visibleFrame.minX + fraction * visibleFrame.width - size.width / 2
         let sideY = visibleFrame.minY + fraction * visibleFrame.height - size.height / 2
@@ -299,12 +332,15 @@ final class WindowDockController {
         static let screenY = "QuotaGlance.dockScreenY"
         static let floatingWidth = "QuotaGlance.floatingWidth"
         static let floatingHeight = "QuotaGlance.floatingHeight"
+        static let mountedScale = "QuotaGlance.mountedScale"
+        static let lastStripVertical = "QuotaGlance.lastStripVertical"
     }
 
     private weak var window: NSWindow?
     private var moveObserver: NSObjectProtocol?
     private var localMouseUpMonitor: Any?
     private var globalMouseUpMonitor: Any?
+    private var scaleGestureMonitor: Any?
     private var isApplyingFrame = false
     private var isResizing = false
     private var sawMove = false
@@ -345,6 +381,20 @@ final class WindowDockController {
         globalMouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in
             Task { @MainActor in self?.finishMoveIfNeeded() }
         }
+        scaleGestureMonitor = NSEvent.addLocalMonitorForEvents(matching: [.magnify, .scrollWheel]) { [weak self, weak window] event in
+            guard let self, let window, event.window === window else { return event }
+            if event.type == .scrollWheel, !event.momentumPhase.isEmpty { return nil }
+            let factor: CGFloat
+            if event.type == .magnify {
+                factor = max(0.82, min(1.18, 1 + event.magnification * 0.85))
+            } else {
+                let delta = max(-12, min(12, event.scrollingDeltaY))
+                guard abs(delta) >= 0.08 else { return nil }
+                factor = exp(delta * (event.hasPreciseScrollingDeltas ? 0.012 : 0.075))
+            }
+            Task { @MainActor in self.resizeWidget(by: factor, window: window) }
+            return nil
+        }
         restoreDock(on: window)
     }
 
@@ -352,6 +402,63 @@ final class WindowDockController {
         guard position.isMounted, let screen = persistedScreen() ?? window.screen ?? NSScreen.main else { return }
         let fraction = UserDefaults.standard.object(forKey: Key.sideFraction) as? Double ?? 0.5
         applyMountedFrame(position, to: window, screen: screen, sideFraction: fraction, animated: false)
+    }
+
+    private func resizeWidget(by factor: CGFloat, window: NSWindow) {
+        guard factor.isFinite, factor > 0 else { return }
+        let currentPosition = position
+        let screen = window.screen ?? screen(at: NSEvent.mouseLocation) ?? NSScreen.main
+        guard let screen else { return }
+
+        if currentPosition.isMounted {
+            let base = currentPosition.mountedSize
+            let minimumScale = max(0.68, 118 / min(base.width, base.height))
+            let oldScale = UserDefaults.standard.object(forKey: Key.mountedScale) as? Double ?? 1
+            let newScale = min(2, max(Double(minimumScale), oldScale * Double(factor)))
+            guard abs(newScale - oldScale) > 0.0005 else { return }
+            UserDefaults.standard.set(newScale, forKey: Key.mountedScale)
+            let fraction = UserDefaults.standard.object(forKey: Key.sideFraction) as? Double ?? 0.5
+            applyMountedFrame(
+                currentPosition,
+                to: window,
+                screen: screen,
+                sideFraction: CGFloat(fraction),
+                animated: false
+            )
+            return
+        }
+
+        let currentSize = window.frame.size
+        let compact = FloatingLayoutGeometry.isCompact(currentSize)
+        let newSize: NSSize
+        if compact, factor > 1, currentSize.width >= 219.5 {
+            let vertical = UserDefaults.standard.bool(forKey: Key.lastStripVertical)
+            newSize = vertical ? NSSize(width: 140, height: 420) : NSSize(width: 420, height: 140)
+        } else {
+            if !compact {
+                UserDefaults.standard.set(currentSize.height > currentSize.width, forKey: Key.lastStripVertical)
+            }
+            let shortSide = min(currentSize.width, currentSize.height)
+            let delta = shortSide * (factor - 1)
+            if compact || currentSize.height > currentSize.width {
+                newSize = FloatingLayoutGeometry.resized(from: currentSize, deltaX: delta, deltaY: 0)
+            } else {
+                newSize = FloatingLayoutGeometry.resized(from: currentSize, deltaX: 0, deltaY: -delta)
+            }
+        }
+
+        let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        var frame = NSRect(
+            x: center.x - newSize.width / 2,
+            y: center.y - newSize.height / 2,
+            width: newSize.width,
+            height: newSize.height
+        )
+        let visible = screen.visibleFrame
+        frame.origin.x = min(max(frame.minX, visible.minX), max(visible.minX, visible.maxX - frame.width))
+        frame.origin.y = min(max(frame.minY, visible.minY), max(visible.minY, visible.maxY - frame.height))
+        apply(frame, to: window, animated: false)
+        saveFloatingSize(newSize)
     }
 
     func undock(_ window: NSWindow? = nil) {
@@ -426,7 +533,15 @@ final class WindowDockController {
     }
 
     private func applyMountedFrame(_ position: DockPosition, to window: NSWindow, screen: NSScreen, sideFraction: CGFloat, animated: Bool) {
-        let frame = DockingGeometry.mountedFrame(for: position, in: screen.visibleFrame, sideFraction: sideFraction)
+        let scale = UserDefaults.standard.object(forKey: Key.mountedScale) as? Double ?? 1
+        let base = position.mountedSize
+        let minimumScale = max(0.68, 118 / min(base.width, base.height))
+        let frame = DockingGeometry.mountedFrame(
+            for: position,
+            in: screen.visibleFrame,
+            sideFraction: sideFraction,
+            scale: min(2, max(minimumScale, CGFloat(scale)))
+        )
         apply(frame, to: window, animated: animated)
     }
 
@@ -470,9 +585,11 @@ final class WindowDockController {
         if let moveObserver { NotificationCenter.default.removeObserver(moveObserver) }
         if let localMouseUpMonitor { NSEvent.removeMonitor(localMouseUpMonitor) }
         if let globalMouseUpMonitor { NSEvent.removeMonitor(globalMouseUpMonitor) }
+        if let scaleGestureMonitor { NSEvent.removeMonitor(scaleGestureMonitor) }
         moveObserver = nil
         localMouseUpMonitor = nil
         globalMouseUpMonitor = nil
+        scaleGestureMonitor = nil
     }
 
 }
@@ -501,6 +618,82 @@ enum WidgetTheme: String, CaseIterable, Identifiable {
     }
 
     var isLight: Bool { self == .eInk }
+}
+
+struct PopoverPalette {
+    let background: Color
+    let surface: Color
+    let raisedSurface: Color
+    let primary: Color
+    let secondary: Color
+    let tertiary: Color
+    let rule: Color
+    let pace: Color
+    let reset: Color
+    let billing: Color
+    let cornerRadius: CGFloat
+    let numberDesign: Font.Design
+}
+
+extension WidgetTheme {
+    var popoverPalette: PopoverPalette {
+        switch self {
+        case .current:
+            return PopoverPalette(
+                background: Color(hex: 0x08121E), surface: Color(hex: 0x0C1927),
+                raisedSurface: Color(hex: 0x112338), primary: .white,
+                secondary: Color.white.opacity(0.68), tertiary: Color.white.opacity(0.38),
+                rule: Color.white.opacity(0.11), pace: Color(hex: 0x2F80ED),
+                reset: Color(hex: 0x68D9A0), billing: Color(hex: 0xF2AD3E),
+                cornerRadius: 18, numberDesign: .rounded
+            )
+        case .marine:
+            return PopoverPalette(
+                background: Color(hex: 0x071321), surface: Color(hex: 0x0B1B2A),
+                raisedSurface: Color(hex: 0x102438), primary: Color(hex: 0xF3F0E7),
+                secondary: Color(hex: 0xB9C5CE), tertiary: Color(hex: 0x718391),
+                rule: Color(hex: 0x66829A).opacity(0.25), pace: Color(hex: 0x3B8FEA),
+                reset: Color(hex: 0x83E2AE), billing: Color(hex: 0xEFB44C),
+                cornerRadius: 15, numberDesign: .monospaced
+            )
+        case .oled:
+            return PopoverPalette(
+                background: Color(hex: 0x050C16), surface: Color(hex: 0x091521),
+                raisedSurface: Color(hex: 0x0E2033), primary: Color(hex: 0xF5F7F5),
+                secondary: Color.white.opacity(0.64), tertiary: Color.white.opacity(0.32),
+                rule: Color.white.opacity(0.09), pace: Color(hex: 0x258DFA),
+                reset: Color(hex: 0x72F5B5), billing: Color(hex: 0xFFB321),
+                cornerRadius: 13, numberDesign: .monospaced
+            )
+        case .radar:
+            return PopoverPalette(
+                background: Color(hex: 0x071313), surface: Color(hex: 0x0B1A19),
+                raisedSurface: Color(hex: 0x0E2320), primary: Color(hex: 0xE8FFF5),
+                secondary: Color(hex: 0xA7C9BC), tertiary: Color(hex: 0x5F8277),
+                rule: Color(hex: 0x5E8B7E).opacity(0.28), pace: Color(hex: 0x2685E5),
+                reset: Color(hex: 0x6FE0AC), billing: Color(hex: 0xE7B24C),
+                cornerRadius: 16, numberDesign: .monospaced
+            )
+        case .eInk:
+            return PopoverPalette(
+                background: Color(hex: 0xE4E1D8), surface: Color(hex: 0xD8D6CF),
+                raisedSurface: Color(hex: 0xF0EEE8), primary: Color(hex: 0x252725),
+                secondary: Color(hex: 0x4F534F), tertiary: Color(hex: 0x747974),
+                rule: Color.black.opacity(0.18), pace: Color(hex: 0x2868B2),
+                reset: Color(hex: 0x3A8B62), billing: Color(hex: 0xA86F13),
+                cornerRadius: 12, numberDesign: .monospaced
+            )
+        case .retro:
+            return PopoverPalette(
+                background: Color(hex: 0x0B0E0B), surface: Color(hex: 0x111611),
+                raisedSurface: Color(hex: 0x172017), primary: Color(hex: 0xD9F5D7),
+                secondary: Color(hex: 0x92B890), tertiary: Color(hex: 0x587157),
+                rule: Color(hex: 0x77A374).opacity(0.24), pace: Color(hex: 0x3182E8),
+                reset: Color(hex: 0x63E18A), billing: Color(hex: 0xE3A633),
+                cornerRadius: 10, numberDesign: .monospaced
+            )
+        }
+    }
 }
 
 enum UsagePaceRate: String, CaseIterable, Identifiable {
@@ -580,6 +773,7 @@ enum ForecastSource: String, CaseIterable, Identifiable, Sendable {
     case codexResets
     case willCodexQuotaReset
     case gussuri
+    case polymarket
     case average
 
     static let defaultsKey = "QuotaGlance.resetCalculatorSource"
@@ -592,6 +786,7 @@ enum ForecastSource: String, CaseIterable, Identifiable, Sendable {
         case .codexResets: return "Codex Resets"
         case .willCodexQuotaReset: return "Will Codex Reset?"
         case .gussuri: return "Reset Observatory"
+        case .polymarket: return "Polymarket"
         case .average: return "Average of All"
         }
     }
@@ -602,7 +797,8 @@ enum ForecastSource: String, CaseIterable, Identifiable, Sendable {
         case .codexResets: return "codex-resets.com"
         case .willCodexQuotaReset: return "willcodexquotareset.com"
         case .gussuri: return "codex.gussuriworks.com"
-        case .average: return "4 calculators"
+        case .polymarket: return "polymarket.com"
+        case .average: return "5 sources"
         }
     }
 
@@ -612,18 +808,150 @@ enum ForecastSource: String, CaseIterable, Identifiable, Sendable {
         case .codexResets: return URL(string: "https://codex-resets.com")
         case .willCodexQuotaReset: return URL(string: "https://www.willcodexquotareset.com")
         case .gussuri: return URL(string: "https://codex.gussuriworks.com/en")
+        case .polymarket:
+            return URL(string: "https://polymarket.com/event/openai-resets-codex-weekly-usage-limit-byptptpt-20260901192000000")
         case .average: return nil
         }
     }
 
     static var calculatorCases: [ForecastSource] {
-        [.lunarWerx, .codexResets, .willCodexQuotaReset, .gussuri]
+        [.lunarWerx, .codexResets, .willCodexQuotaReset, .gussuri, .polymarket]
+    }
+}
+
+enum ForecastSourceSelection {
+    static let defaultsKey = "QuotaGlance.resetCalculatorSources"
+
+    static func load(from defaults: UserDefaults = .standard) -> Set<ForecastSource> {
+        if let stored = defaults.array(forKey: defaultsKey) as? [String] {
+            let sources = Set(stored.compactMap(ForecastSource.init(rawValue:)))
+                .intersection(ForecastSource.calculatorCases)
+            if !sources.isEmpty { return sources }
+        }
+        let legacy = ForecastSource(
+            rawValue: defaults.string(forKey: ForecastSource.defaultsKey) ?? ""
+        ) ?? .lunarWerx
+        return legacy == .average ? Set(ForecastSource.calculatorCases) : [legacy]
+    }
+
+    static func save(_ sources: Set<ForecastSource>, to defaults: UserDefaults = .standard) {
+        let valid = sources.intersection(ForecastSource.calculatorCases)
+        guard !valid.isEmpty else { return }
+        let ordered = ForecastSource.calculatorCases.filter(valid.contains)
+        defaults.set(ordered.map(\.rawValue), forKey: defaultsKey)
+        defaults.set(
+            ordered.count == 1 ? ordered[0].rawValue : ForecastSource.average.rawValue,
+            forKey: ForecastSource.defaultsKey
+        )
+    }
+
+    static func label(for sources: Set<ForecastSource>) -> String {
+        let ordered = ForecastSource.calculatorCases.filter(sources.contains)
+        if ordered.count == 1 { return ordered[0].displayName }
+        return "Average of \(ordered.count)"
+    }
+}
+
+@MainActor
+private final class ResetCalculatorMenuView: NSView {
+    private var buttons: [ForecastSource: NSButton] = [:]
+    private let selectionLabel = NSTextField(labelWithString: "")
+
+    init(selectedSources: Set<ForecastSource>) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 238, height: 184))
+
+        let title = NSTextField(labelWithString: "AVERAGE SELECTED SOURCES")
+        title.font = .monospacedSystemFont(ofSize: 9, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+
+        selectionLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        selectionLabel.textColor = .labelColor
+
+        let header = NSStackView(views: [title, selectionLabel])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 2
+
+        let sourceStack = NSStackView()
+        sourceStack.orientation = .vertical
+        sourceStack.alignment = .leading
+        sourceStack.spacing = 2
+
+        for source in ForecastSource.calculatorCases {
+            let button = NSButton(
+                checkboxWithTitle: source.displayName,
+                target: self,
+                action: #selector(toggleSource(_:))
+            )
+            button.identifier = NSUserInterfaceItemIdentifier(source.rawValue)
+            button.state = selectedSources.contains(source) ? .on : .off
+            button.font = .systemFont(ofSize: 13)
+            button.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            sourceStack.addArrangedSubview(button)
+            button.widthAnchor.constraint(equalToConstant: 214).isActive = true
+            buttons[source] = button
+        }
+
+        let stack = NSStackView(views: [header, sourceStack])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 9
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10)
+        ])
+
+        updateSelectionLabel(selectedSources)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    @objc private func toggleSource(_ sender: NSButton) {
+        guard
+            let rawValue = sender.identifier?.rawValue,
+            let source = ForecastSource(rawValue: rawValue),
+            ForecastSource.calculatorCases.contains(source)
+        else { return }
+
+        var selected = ForecastSourceSelection.load()
+        if sender.state == .on {
+            selected.insert(source)
+        } else if selected.count > 1 {
+            selected.remove(source)
+        } else {
+            sender.state = .on
+            NSSound.beep()
+            return
+        }
+
+        ForecastSourceSelection.save(selected)
+        for (source, button) in buttons {
+            button.state = selected.contains(source) ? .on : .off
+        }
+        updateSelectionLabel(selected)
+        NotificationCenter.default.post(
+            name: .quotaGlanceResetCalculatorChanged,
+            object: ForecastSource.calculatorCases.filter(selected.contains).map(\.rawValue)
+        )
+    }
+
+    private func updateSelectionLabel(_ selected: Set<ForecastSource>) {
+        selectionLabel.stringValue = ForecastSourceSelection.label(for: selected)
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
+    private let statusPopover = NSPopover()
+    private var statusClockTimer: Timer?
     private var shouldExitForExistingInstance = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -655,12 +983,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !shouldExitForExistingInstance else { return }
         NSApp.setActivationPolicy(.accessory)
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: "Quota Glance")
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.target = self
-        item.button?.action = #selector(openStatusMenu)
+        item.button?.action = #selector(handleStatusItemClick)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem = item
+        configureStatusPopover()
+        updateStatusItem()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(menuBarSummaryChanged),
+            name: .quotaGlanceMenuBarSummaryChanged,
+            object: nil
+        )
+        statusClockTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updateStatusItem() }
+        }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.enableLaunchAtLoginIfNeeded()
@@ -672,8 +1010,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func openStatusMenu() {
-        showMenu()
+    func applicationWillTerminate(_ notification: Notification) {
+        statusClockTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func handleStatusItemClick() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            statusPopover.performClose(nil)
+            showMenu()
+        } else {
+            toggleStatusPopover()
+        }
+    }
+
+    private func configureStatusPopover() {
+        statusPopover.behavior = .transient
+        statusPopover.animates = true
+        statusPopover.contentSize = NSSize(width: 386, height: 430)
+        statusPopover.contentViewController = NSHostingController(
+            rootView: MenuBarSummaryPopover(
+                summary: .shared,
+                onOpenWidget: { [weak self] in
+                    self?.statusPopover.performClose(nil)
+                    self?.toggleDashboardVisibility(forceShow: true)
+                },
+                onOpenTweets: { [weak self] in
+                    self?.statusPopover.performClose(nil)
+                    self?.toggleDashboardVisibility(forceShow: true)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        NotificationCenter.default.post(name: .quotaGlanceShowTweets, object: nil)
+                    }
+                },
+                onRefresh: {
+                    NotificationCenter.default.post(name: .quotaGlanceRefresh, object: nil)
+                }
+            )
+        )
+    }
+
+    private func toggleStatusPopover() {
+        guard let button = statusItem?.button else { return }
+        NotificationCenter.default.post(name: .quotaGlanceMenuInteraction, object: nil)
+        if statusPopover.isShown {
+            statusPopover.performClose(nil)
+        } else {
+            statusPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc private func menuBarSummaryChanged() {
+        updateStatusItem()
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else { return }
+        let mode = MenuBarDisplayMode(
+            rawValue: UserDefaults.standard.string(forKey: MenuBarDisplayMode.defaultsKey) ?? ""
+        ) ?? .smart
+        let summary = MenuBarSummaryModel.shared
+        statusPopover.contentSize = NSSize(
+            width: 386,
+            height: summary.shortWindow == nil ? 378 : 470
+        )
+        let title = summary.statusText(mode: mode)
+        let result = NSMutableAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.labelColor
+            ]
+        )
+        if summary.payload.unreadTweet {
+            result.append(NSAttributedString(
+                string: " •",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                    .foregroundColor: NSColor.systemBlue
+                ]
+            ))
+        }
+        if summary.freshness != .live, mode != .iconOnly {
+            result.append(NSAttributedString(
+                string: " !",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+                    .foregroundColor: summary.freshness == .offline ? NSColor.systemRed : NSColor.systemOrange
+                ]
+            ))
+        }
+        button.image = nil
+        button.attributedTitle = result
+        button.toolTip = "Quota Glance · \(summary.freshness.rawValue.capitalized)"
+        button.setAccessibilityLabel("Quota Glance, \(title), \(summary.freshness.rawValue)")
     }
 
     private var dashboardWindow: NSWindow? {
@@ -712,7 +1141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let dashboardIsVisible = dashboardWindow?.isVisible == true
         menu.addItem(
             withTitle: dashboardIsVisible ? "Hide Quota Glance" : "Show Quota Glance",
-            action: #selector(toggleDashboardVisibility),
+            action: #selector(toggleDashboardVisibilityFromMenu),
             keyEquivalent: ""
         )
         menu.addItem(withTitle: "Refresh now", action: #selector(refresh), keyEquivalent: "r")
@@ -730,6 +1159,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             loginItem.state = .off
         }
         menu.addItem(loginItem)
+        let menuBarItem = NSMenuItem(title: "Menu Bar", action: nil, keyEquivalent: "")
+        let menuBarMenu = NSMenu(title: "Menu Bar")
+        let selectedMenuBarMode = MenuBarDisplayMode(
+            rawValue: UserDefaults.standard.string(forKey: MenuBarDisplayMode.defaultsKey) ?? ""
+        ) ?? .smart
+        for mode in MenuBarDisplayMode.allCases {
+            let item = NSMenuItem(
+                title: mode.displayName,
+                action: #selector(selectMenuBarDisplay(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = mode.rawValue
+            item.state = mode == selectedMenuBarMode ? .on : .off
+            menuBarMenu.addItem(item)
+        }
+        menuBarItem.submenu = menuBarMenu
+        menu.addItem(menuBarItem)
         let themeItem = NSMenuItem(title: "Theme", action: nil, keyEquivalent: "")
         let themeMenu = NSMenu(title: "Theme")
         let selectedTheme = WidgetTheme(
@@ -769,22 +1216,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(paceRateItem)
         let resetCalculatorItem = NSMenuItem(title: "Reset Calculator", action: nil, keyEquivalent: "")
         let resetCalculatorMenu = NSMenu(title: "Reset Calculator")
-        let selectedResetCalculator = ForecastSource(
-            rawValue: UserDefaults.standard.string(forKey: ForecastSource.defaultsKey) ?? ""
-        ) ?? .lunarWerx
-        for source in ForecastSource.allCases {
-            let item = NSMenuItem(
-                title: source.displayName,
-                action: #selector(selectResetCalculator(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = source.rawValue
-            item.state = source == selectedResetCalculator ? .on : .off
-            resetCalculatorMenu.addItem(item)
-        }
+        let selectedResetCalculators = ForecastSourceSelection.load()
+        let resetCalculatorPicker = NSMenuItem()
+        resetCalculatorPicker.view = ResetCalculatorMenuView(
+            selectedSources: selectedResetCalculators
+        )
+        resetCalculatorMenu.addItem(resetCalculatorPicker)
         resetCalculatorItem.submenu = resetCalculatorMenu
         menu.addItem(resetCalculatorItem)
+        menu.addItem(resetActionsMenuItem())
+        menu.addItem(privateLiveFeedMenuItem())
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }
@@ -793,9 +1234,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = nil
     }
 
-    @objc private func toggleDashboardVisibility() {
+    @objc private func toggleDashboardVisibilityFromMenu() {
+        toggleDashboardVisibility(forceShow: false)
+    }
+
+    private func toggleDashboardVisibility(forceShow: Bool) {
         guard let window = dashboardWindow else { return }
-        if window.isVisible {
+        if window.isVisible && !forceShow {
             window.orderOut(nil)
         } else {
             show(window)
@@ -814,6 +1259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refresh() {
+        NotificationCenter.default.post(name: .quotaGlanceMenuInteraction, object: nil)
         NotificationCenter.default.post(name: .quotaGlanceRefresh, object: nil)
     }
 
@@ -844,6 +1290,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.post(name: .quotaGlanceThemeChanged, object: rawValue)
     }
 
+    @objc private func selectMenuBarDisplay(_ sender: NSMenuItem) {
+        guard
+            let rawValue = sender.representedObject as? String,
+            MenuBarDisplayMode(rawValue: rawValue) != nil
+        else { return }
+        UserDefaults.standard.set(rawValue, forKey: MenuBarDisplayMode.defaultsKey)
+        updateStatusItem()
+    }
+
     @objc private func selectPaceRate(_ sender: NSMenuItem) {
         guard
             let rawValue = sender.representedObject as? String,
@@ -853,13 +1308,242 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.post(name: .quotaGlancePaceRateChanged, object: rawValue)
     }
 
-    @objc private func selectResetCalculator(_ sender: NSMenuItem) {
+    @objc private func toggleResetCalculator(_ sender: NSMenuItem) {
         guard
             let rawValue = sender.representedObject as? String,
-            ForecastSource(rawValue: rawValue) != nil
+            let source = ForecastSource(rawValue: rawValue),
+            ForecastSource.calculatorCases.contains(source)
         else { return }
-        UserDefaults.standard.set(rawValue, forKey: ForecastSource.defaultsKey)
-        NotificationCenter.default.post(name: .quotaGlanceResetCalculatorChanged, object: rawValue)
+        var selected = ForecastSourceSelection.load()
+        if selected.contains(source) {
+            guard selected.count > 1 else {
+                NSSound.beep()
+                return
+            }
+            selected.remove(source)
+        } else {
+            selected.insert(source)
+        }
+        ForecastSourceSelection.save(selected)
+        sender.state = selected.contains(source) ? .on : .off
+        NotificationCenter.default.post(
+            name: .quotaGlanceResetCalculatorChanged,
+            object: ForecastSource.calculatorCases.filter(selected.contains).map(\.rawValue)
+        )
+    }
+
+    private func resetActionsMenuItem() -> NSMenuItem {
+        let root = NSMenuItem(title: "Reset Actions", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Reset Actions")
+
+        let sound = NSMenuItem(
+            title: "Fairy Sound",
+            action: #selector(toggleResetSound),
+            keyEquivalent: ""
+        )
+        sound.state = ResetAutomationSettings.soundEnabled ? .on : .off
+        submenu.addItem(sound)
+
+        let clockStarter = NSMenuItem(
+            title: "Start Weekly Clock with Hello",
+            action: #selector(toggleResetClockStarter),
+            keyEquivalent: ""
+        )
+        clockStarter.state = ResetClockStarterSettings.isEnabled ? .on : .off
+        submenu.addItem(clockStarter)
+        if let result = ResetClockStarterSettings.lastResult {
+            let status = NSMenuItem(title: "Last hello: \(result)", action: nil, keyEquivalent: "")
+            status.isEnabled = false
+            submenu.addItem(status)
+        }
+        submenu.addItem(.separator())
+
+        let shortcutTitle = ResetAutomationSettings.shortcutName.map { "Shortcut: \($0)" }
+            ?? "Choose Shortcut…"
+        submenu.addItem(withTitle: shortcutTitle, action: #selector(configureResetShortcut), keyEquivalent: "")
+        if ResetAutomationSettings.shortcutName != nil {
+            submenu.addItem(withTitle: "Clear Shortcut", action: #selector(clearResetShortcut), keyEquivalent: "")
+        }
+
+        let hookTitle = ResetAutomationSettings.executablePath.map {
+            "Hook: \(($0 as NSString).lastPathComponent)"
+        } ?? "Choose Executable Hook…"
+        submenu.addItem(withTitle: hookTitle, action: #selector(chooseResetHook), keyEquivalent: "")
+        if ResetAutomationSettings.executablePath != nil {
+            submenu.addItem(withTitle: "Clear Executable Hook", action: #selector(clearResetHook), keyEquivalent: "")
+        }
+
+        submenu.addItem(.separator())
+        submenu.addItem(withTitle: "Test Sound & Hook", action: #selector(testResetActions), keyEquivalent: "")
+        submenu.addItem(withTitle: "Send Test Hello Now", action: #selector(testResetClockStarter), keyEquivalent: "")
+        submenu.items.forEach { $0.target = self }
+        root.submenu = submenu
+        return root
+    }
+
+    private func privateLiveFeedMenuItem() -> NSMenuItem {
+        let root = NSMenuItem(title: "Private iPhone Live Feed", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Private iPhone Live Feed")
+
+        let status = NSMenuItem(title: PrivateLiveActivitySettings.statusText, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        submenu.addItem(status)
+
+        let enabled = NSMenuItem(title: "Enabled", action: #selector(togglePrivateLiveFeed), keyEquivalent: "")
+        enabled.state = PrivateLiveActivitySettings.isEnabled ? .on : .off
+        enabled.isEnabled = PrivateLiveActivitySettings.isConfigured
+        submenu.addItem(enabled)
+        submenu.addItem(.separator())
+        submenu.addItem(withTitle: "Configure APNs Key…", action: #selector(configurePrivateLiveFeed), keyEquivalent: "")
+        if PrivateLiveActivitySettings.isConfigured {
+            submenu.addItem(withTitle: "Send Test Update", action: #selector(testPrivateLiveFeed), keyEquivalent: "")
+            submenu.addItem(withTitle: "Remove Private Key", action: #selector(clearPrivateLiveFeed), keyEquivalent: "")
+        }
+        submenu.items.forEach { $0.target = self }
+        root.submenu = submenu
+        return root
+    }
+
+    @objc private func togglePrivateLiveFeed() {
+        guard PrivateLiveActivitySettings.isConfigured else { return }
+        UserDefaults.standard.set(
+            !PrivateLiveActivitySettings.isEnabled,
+            forKey: PrivateLiveActivitySettings.enabledKey
+        )
+    }
+
+    @objc private func configurePrivateLiveFeed() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose your private APNs signing key"
+        panel.message = "The .p8 file will be stored only in this Mac’s Keychain."
+        panel.prompt = "Choose Key"
+        panel.allowedContentTypes = [.data]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let pem = try? String(contentsOf: url, encoding: .utf8) else { return }
+
+        let filenameKeyID = url.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "AuthKey_", with: "")
+        let keyID = NSTextField(string: PrivateLiveActivitySettings.keyID ?? filenameKeyID)
+        keyID.placeholderString = "APNs Key ID"
+        let teamID = NSTextField(string: PrivateLiveActivitySettings.teamID ?? "5DYDN5X5T2")
+        teamID.placeholderString = "Apple Developer Team ID"
+        let labels = NSStackView(views: [
+            NSTextField(labelWithString: "Key ID"), keyID,
+            NSTextField(labelWithString: "Team ID"), teamID
+        ])
+        labels.orientation = .vertical
+        labels.spacing = 6
+        labels.frame = NSRect(x: 0, y: 0, width: 340, height: 92)
+
+        let alert = NSAlert()
+        alert.messageText = "Configure private Live Activity updates"
+        alert.informativeText = "These credentials remain in your local Keychain and are never included in phone snapshots or uploads."
+        alert.accessoryView = labels
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            try PrivateAPNsKeychain.save(pem)
+            UserDefaults.standard.set(keyID.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: PrivateLiveActivitySettings.keyIDKey)
+            UserDefaults.standard.set(teamID.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: PrivateLiveActivitySettings.teamIDKey)
+            UserDefaults.standard.set(true, forKey: PrivateLiveActivitySettings.enabledKey)
+            UserDefaults.standard.set("Configured · waiting for iPhone", forKey: PrivateLiveActivitySettings.lastStatusKey)
+        } catch {
+            let failure = NSAlert(error: error)
+            failure.runModal()
+        }
+    }
+
+    @objc private func testPrivateLiveFeed() {
+        Task {
+            await PrivateLiveActivityRelay.shared.forceNextUpdate()
+            await MainActor.run {
+                NotificationCenter.default.post(name: .quotaGlancePrivateLiveFeedTest, object: nil)
+            }
+        }
+    }
+
+    @objc private func clearPrivateLiveFeed() {
+        PrivateAPNsKeychain.delete()
+        UserDefaults.standard.removeObject(forKey: PrivateLiveActivitySettings.keyIDKey)
+        UserDefaults.standard.removeObject(forKey: PrivateLiveActivitySettings.teamIDKey)
+        UserDefaults.standard.removeObject(forKey: PrivateLiveActivitySettings.enabledKey)
+        UserDefaults.standard.removeObject(forKey: PrivateLiveActivitySettings.lastStatusKey)
+    }
+
+    @objc private func toggleResetSound() {
+        UserDefaults.standard.set(
+            !ResetAutomationSettings.soundEnabled,
+            forKey: ResetAutomationSettings.soundEnabledKey
+        )
+    }
+
+    @objc private func toggleResetClockStarter() {
+        UserDefaults.standard.set(
+            !ResetClockStarterSettings.isEnabled,
+            forKey: ResetClockStarterSettings.enabledKey
+        )
+    }
+
+    @objc private func testResetClockStarter() {
+        ResetClockStarter.forceTest()
+    }
+
+    @objc private func configureResetShortcut() {
+        let alert = NSAlert()
+        alert.messageText = "Shortcut after a quota reset"
+        alert.informativeText = "Enter the exact name of a Shortcut in the Shortcuts app. It will run only after a confirmed reset."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: ResetAutomationSettings.shortcutName ?? "")
+        field.placeholderString = "Shortcut name"
+        field.frame = NSRect(x: 0, y: 0, width: 310, height: 24)
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            UserDefaults.standard.removeObject(forKey: ResetAutomationSettings.shortcutNameKey)
+        } else {
+            UserDefaults.standard.set(value, forKey: ResetAutomationSettings.shortcutNameKey)
+        }
+    }
+
+    @objc private func clearResetShortcut() {
+        UserDefaults.standard.removeObject(forKey: ResetAutomationSettings.shortcutNameKey)
+    }
+
+    @objc private func chooseResetHook() {
+        let panel = NSOpenPanel()
+        panel.message = "Choose a trusted executable or script to run after a confirmed quota reset."
+        panel.prompt = "Choose Hook"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        UserDefaults.standard.set(url.path, forKey: ResetAutomationSettings.executablePathKey)
+    }
+
+    @objc private func clearResetHook() {
+        UserDefaults.standard.removeObject(forKey: ResetAutomationSettings.executablePathKey)
+    }
+
+    @objc private func testResetActions() {
+        let summary = MenuBarSummaryModel.shared
+        if ResetAutomationSettings.soundEnabled { ResetCompletionSound.play() }
+        ResetAutomationRunner.dispatch(
+            ResetAutomationEvent(
+                event: "quota_reset_test",
+                observedAt: Date(),
+                usedPercent: summary.weeklyWindow?.usedPercent ?? 0,
+                resetAt: summary.weeklyWindow?.resetAt,
+                planName: summary.payload.planName
+            )
+        )
     }
 
     private func enableLaunchAtLoginIfNeeded() {
@@ -932,6 +1616,20 @@ struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
+enum ResetCompletionSound {
+    private static var player: NSSound?
+
+    static func play() {
+        guard let url = Bundle.main.url(forResource: "QuotaResetFairy", withExtension: "caf") else {
+            NSSound(named: .init("Glass"))?.play()
+            return
+        }
+        player = NSSound(contentsOf: url, byReference: true)
+        player?.volume = 0.72
+        player?.play()
+    }
+}
+
 @MainActor
 final class DashboardModel: ObservableObject {
     @Published var usedPercent: Double?
@@ -942,13 +1640,22 @@ final class DashboardModel: ObservableObject {
     @Published var weeklyTokens: Int64?
     @Published var localTokensTotal: Int64?
     @Published var localTokenPace: LocalTokenPaceSnapshot?
+    @Published var usageIntelligence: UsageIntelligenceSnapshot?
+    @Published var secondaryQuota: SecondaryQuotaSnapshot?
+    @Published var quotaInventory: [CodexQuotaWindow] = []
+    @Published var creditSummary: CodexCreditSummary?
+    @Published var resetCredits: [CodexResetCredit] = []
+    @Published var activeTasks: [CodexTaskSnapshot] = []
     @Published var usageDays: [UsageDay] = []
     @Published var usageHistory: [UsageCheckpoint] = UsageHistoryStore.load()
+    @Published var weeklyArchives: [WeeklyUsageArchive] = WeeklyUsageArchiveStore.load()
     @Published var usageWindowStart: Date?
     @Published var usageWindowDurationMinutes: Double?
     @Published var forecastPercent: Double?
     @Published var forecastLabel: String?
     @Published var resetAnnouncement: ResetAnnouncement?
+    @Published var resetApplicabilityQuestion: ResetAnnouncement?
+    @Published var resetLifecycle = ResetLifecycleStore.load()
     @Published var resetIntel: ResetIntelSnapshot?
     @Published var newTweetAlert: TiboTweet?
     @Published var forecastSnapshot: ForecastSnapshot?
@@ -958,21 +1665,25 @@ final class DashboardModel: ObservableObject {
     @Published var lastUpdated: Date?
     @Published var isRefreshing = false
 
-    private var usageTimer: Timer?
+    private var usageRefreshTask: Task<Void, Never>?
     private var forecastTimer: Timer?
     private var progressTimer: Timer?
     private var forecastRefreshGeneration = 0
+    private var lastCodexSuccessfulAt: Date?
+    private var lastCodexAttemptFailed = false
+    private var lastMenuInteractionAt: Date?
+    private var lastCodingActivityAt: Date?
+    private var previousLocalTokenTotal: Int64?
+    private let adaptiveRefreshPolicy = AdaptiveRefreshPolicy()
     private let observedTweetKey = "QuotaGlance.observedTiboTweetID"
     private let clearedTweetKey = "QuotaGlance.clearedTiboTweetID"
+    private let observedTweetsKey = "QuotaGlance.observedTiboTweetIDs.v2"
+    private let tweetWatermarkKey = "QuotaGlance.observedTiboTweetDate.v2"
     init() {
+        NSUbiquitousKeyValueStore.default.synchronize()
         restoreCachedCodexState()
         refresh()
-        // Reading local rollout logs is the expensive part of the widget and
-        // history itself is stored in five-minute buckets. Do that work once
-        // per bucket instead of pointlessly rescanning the same files 5 times.
-        usageTimer = Timer.scheduledTimer(withTimeInterval: 5 * 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshCodex() }
-        }
+        startAdaptiveUsageRefresh()
         // Reset forecasts and Tibo posts remain lightweight and timely.
         forecastTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshForecast() }
@@ -986,7 +1697,7 @@ final class DashboardModel: ObservableObject {
     }
 
     deinit {
-        usageTimer?.invalidate()
+        usageRefreshTask?.cancel()
         forecastTimer?.invalidate()
         progressTimer?.invalidate()
     }
@@ -1001,21 +1712,100 @@ final class DashboardModel: ObservableObject {
         refreshCodex()
     }
 
+    func noteMenuInteraction() {
+        lastMenuInteractionAt = Date()
+        // Opening the summary should never leave visibly stale data waiting
+        // for the ordinary adaptive timer.
+        if lastCodexSuccessfulAt.map({ Date().timeIntervalSince($0) >= 2 * 60 }) ?? true {
+            refreshCodex()
+        }
+    }
+
+    private func startAdaptiveUsageRefresh() {
+        usageRefreshTask?.cancel()
+        usageRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let process = ProcessInfo.processInfo
+                let constrained = process.isLowPowerModeEnabled
+                    || process.thermalState == .serious
+                    || process.thermalState == .critical
+                let decision = adaptiveRefreshPolicy.nextDelay(for: .init(
+                    now: Date(),
+                    lastInteractionAt: lastMenuInteractionAt,
+                    lastCodingActivityAt: lastCodingActivityAt,
+                    isConstrained: constrained,
+                    pendingResetConfirmation: resetLifecycle.hasPendingResetCandidate
+                ))
+                var remaining = decision.interval
+                while remaining > 0, !Task.isCancelled {
+                    let slice = min(60, remaining)
+                    do {
+                        try await Task.sleep(for: .seconds(slice))
+                    } catch {
+                        return
+                    }
+                    remaining -= slice
+                    if let activity = CodexActivityProbe.latestActivity(),
+                       Date().timeIntervalSince(activity) <= 5 * 60 {
+                        lastCodingActivityAt = max(lastCodingActivityAt ?? .distantPast, activity)
+                        // The probe itself already supplied the one-minute
+                        // throttle, so refresh now instead of making an active
+                        // turn wait through a second minute.
+                        remaining = 0
+                    }
+                }
+                await performCodexRefresh()
+            }
+        }
+    }
+
+    func rebuildUsageIntelligence() {
+        guard let windowStart = usageWindowStart else { return }
+        Task {
+            let snapshot = await Task.detached(priority: .utility) {
+                try? UsageIntelligenceStore.rebuild(windowStart: windowStart)
+            }.value
+            if let snapshot {
+                usageIntelligence = snapshot
+                publishMobileSnapshot()
+            }
+        }
+    }
+
+    func purgeUsageData() {
+        try? UsageIntelligenceStore.purge()
+        UsageHistoryStore.purge()
+        usageHistory = []
+        if let windowStart = usageWindowStart {
+            usageIntelligence = .empty(windowStart: windowStart)
+        } else {
+            usageIntelligence = nil
+        }
+        publishMobileSnapshot()
+    }
+
     private func refreshCodex() {
+        Task { await performCodexRefresh() }
+    }
+
+    private func performCodexRefresh() async {
         guard !isRefreshing else { return }
         isRefreshing = true
-        Task {
-            do {
-                let liveSnapshot = try await CodexService.fetch()
-                let cached = CodexSnapshotStore.save(liveSnapshot)
-                applyCodexSnapshot(cached.snapshot, recordedAt: cached.savedAt, isLive: true)
-            } catch {
-                codexStatus = error.localizedDescription
-            }
-
-            lastUpdated = Date()
-            isRefreshing = false
+        do {
+            let liveSnapshot = try await CodexService.fetch()
+            let cached = CodexSnapshotStore.save(liveSnapshot)
+            lastCodexSuccessfulAt = cached.savedAt
+            lastCodexAttemptFailed = false
+            applyCodexSnapshot(cached.snapshot, recordedAt: cached.savedAt, isLive: true)
+        } catch {
+            lastCodexAttemptFailed = true
+            codexStatus = error.localizedDescription
+            publishMenuBarSummary()
         }
+
+        lastUpdated = Date()
+        isRefreshing = false
     }
 
     private func refreshForecast() {
@@ -1043,32 +1833,73 @@ final class DashboardModel: ObservableObject {
         }
     }
 
-    func selectForecastSource(_ rawValue: String) {
-        guard let source = ForecastSource(rawValue: rawValue) else { return }
+    func selectForecastSources(_ rawValues: [String]) {
+        let sources = Set(rawValues.compactMap(ForecastSource.init(rawValue:)))
+            .intersection(ForecastSource.calculatorCases)
+        guard !sources.isEmpty else { return }
 
         // Every provider result is already retained in forecastSnapshot.
         // Recompose from that cache synchronously so the dial changes during
         // the menu click itself, then verify all sources in the background.
         if let providers = forecastSnapshot?.providers,
-           let cached = try? ForecastService.snapshot(from: providers, selected: source) {
+           let cached = try? ForecastService.snapshot(from: providers, selected: sources) {
             applyForecast(cached, statusPrefix: "Cached")
         }
         refreshForecast()
     }
 
     private func applyForecast(_ forecast: ForecastSnapshot, statusPrefix: String) {
-        forecastPercent = forecast.score
+        resetLifecycle = ResetLifecycleStore.observeAnnouncement(forecast.announcement)
         forecastLabel = forecast.displayLabel
-        resetAnnouncement = forecast.announcement
+        let activeAnnouncement = resetLifecycle.isRecentlyCompleted()
+            ? nil
+            : activeAnnouncementAfterLastCompletion(forecast.announcement)
+        let response = activeAnnouncement.flatMap { announcement -> ResetApplicabilityResponse? in
+            guard announcement.requiresApplicabilityConfirmation,
+                  let response = ResetApplicability.load(),
+                  response.announcementID == announcement.id else { return nil }
+            return response
+        }
+        let declined = response?.applies == false
+        forecastPercent = declined ? forecast.baselineScore : forecast.score
+        resetAnnouncement = declined ? nil : activeAnnouncement
+        resetApplicabilityQuestion = activeAnnouncement?.requiresApplicabilityConfirmation == true
+            && response == nil ? activeAnnouncement : nil
         updateTweetAlert(from: forecast.intel?.tweets ?? [])
         resetIntel = forecast.intel
         forecastSnapshot = forecast
-        forecastURL = forecast.source.url
+        forecastURL = ForecastSource.calculatorCases
+            .first(where: forecast.selectedSources.contains)?.url
             ?? forecast.providers.first?.source.url
             ?? URL(string: "https://codex.lunarwerx.com")!
-        forecastStatus = "\(statusPrefix) · \(forecast.source.hostLabel)"
+        forecastStatus = "\(statusPrefix) · \(ForecastSourceSelection.label(for: forecast.selectedSources))"
         lastUpdated = Date()
+        publishMenuBarSummary()
         publishMobileSnapshot()
+    }
+
+    func answerResetApplicability(_ applies: Bool) {
+        guard let announcement = resetApplicabilityQuestion ?? forecastSnapshot?.announcement else { return }
+        ResetApplicability.save(announcementID: announcement.id, applies: applies)
+        resetApplicabilityQuestion = nil
+        if let forecastSnapshot {
+            applyForecast(forecastSnapshot, statusPrefix: "Account answer")
+        }
+    }
+
+    func syncResetApplicabilityFromCloud() {
+        guard let forecastSnapshot else { return }
+        applyForecast(forecastSnapshot, statusPrefix: "Synced answer")
+    }
+
+    private func activeAnnouncementAfterLastCompletion(
+        _ announcement: ResetAnnouncement?
+    ) -> ResetAnnouncement? {
+        guard let announcement, announcement.isActive() else { return nil }
+        guard let completedAt = resetLifecycle.completedAt else { return announcement }
+        if announcement.detectedAt <= completedAt { return nil }
+        if let expectedAt = announcement.expectedAt, expectedAt <= completedAt { return nil }
+        return announcement
     }
 
     private func restoreCachedCodexState() {
@@ -1083,6 +1914,7 @@ final class DashboardModel: ObservableObject {
         resetAt = checkpoint.resetAt
         weeklyTokens = checkpoint.weeklyTokens
         localTokensTotal = checkpoint.localTokensTotal
+        usageIntelligence = UsageIntelligenceStore.cachedSnapshot(windowStart: checkpoint.windowStart)
         usageWindowStart = checkpoint.windowStart
         weekElapsedPercent = CodexService.calendarProgress(to: checkpoint.resetAt, at: Date())
         lastUpdated = checkpoint.recordedAt
@@ -1094,13 +1926,73 @@ final class DashboardModel: ObservableObject {
         recordedAt: Date,
         isLive: Bool
     ) {
+        if isLive,
+           let previousWindowStart = usageWindowStart,
+           snapshot.usageWindowStart.timeIntervalSince(previousWindowStart) > UsageHistoryStore.windowTolerance,
+           let previousResetAt = resetAt {
+            weeklyArchives = WeeklyUsageArchiveStore.capture(
+                windowStart: previousWindowStart,
+                resetAt: previousResetAt,
+                finalUsedPercent: usedPercent ?? 0,
+                intelligence: usageIntelligence,
+                checkpoints: usageHistory,
+                capturedAt: recordedAt
+            )
+        }
+        let previousResetCompletion = resetLifecycle.completedAt
+        resetLifecycle = ResetLifecycleStore.observeUsage(
+            windowStart: snapshot.usageWindowStart,
+            usedPercent: snapshot.usedPercent,
+            planName: snapshot.planName,
+            observedAt: recordedAt
+        )
+        let justReset = resetLifecycle.completedAt != nil
+            && resetLifecycle.completedAt != previousResetCompletion
+        if justReset && isLive && ResetAutomationSettings.soundEnabled {
+            ResetCompletionSound.play()
+        }
+        if justReset && isLive {
+            ResetAutomationRunner.dispatch(
+                ResetAutomationEvent(
+                    event: "quota_reset",
+                    observedAt: recordedAt,
+                    usedPercent: snapshot.usedPercent,
+                    resetAt: snapshot.resetAt,
+                    planName: snapshot.planName
+                )
+            )
+        }
+        if isLive,
+           resetLifecycle.isRecentlyCompleted(at: recordedAt),
+           let completedAt = resetLifecycle.completedAt {
+            ResetClockStarter.startIfNeeded(for: completedAt, now: recordedAt)
+        }
+        if resetLifecycle.isRecentlyCompleted() {
+            resetAnnouncement = nil
+        }
         resetAt = snapshot.resetAt
         resetDeadlineIsCredit = snapshot.resetDeadlineIsCredit
         planName = snapshot.planName
         BillingSyncCoordinator.noteLocalPlan(snapshot.planName)
         weeklyTokens = snapshot.weeklyTokens
         localTokensTotal = snapshot.localTokensTotal
+        if isLive,
+           let previousLocalTokenTotal,
+           let currentTotal = snapshot.localTokensTotal,
+           currentTotal > previousLocalTokenTotal {
+            lastCodingActivityAt = recordedAt
+        }
+        previousLocalTokenTotal = snapshot.localTokensTotal
         localTokenPace = snapshot.localTokenPace
+        usageIntelligence = snapshot.usageIntelligence
+        secondaryQuota = snapshot.secondaryQuota
+        quotaInventory = snapshot.quotaInventory ?? []
+        creditSummary = snapshot.creditSummary
+        resetCredits = snapshot.resetCredits ?? []
+        activeTasks = snapshot.activeTasks ?? []
+        if isLive, !activeTasks.isEmpty {
+            lastCodingActivityAt = recordedAt
+        }
         if let total = snapshot.localTokensTotal,
            let sinceReset = snapshot.localTokenPace?.sinceReset {
             LocalTokenBaselineStore.note(
@@ -1119,7 +2011,9 @@ final class DashboardModel: ObservableObject {
                     usedPercent: snapshot.usedPercent,
                     weeklyTokens: snapshot.weeklyTokens,
                     localTokensTotal: snapshot.localTokensTotal,
-                    rollingFiveMinuteTokens: snapshot.localTokenPace?.fiveMinutes
+                    rollingFiveMinuteTokens: snapshot.localTokenPace?.fiveMinutes,
+                    apiEquivalentUSD: snapshot.usageIntelligence?.apiEquivalentUSD,
+                    quotaWeightedUSD: snapshot.usageIntelligence?.quotaWeightedUSD
                 )
             )
         }
@@ -1129,28 +2023,51 @@ final class DashboardModel: ObservableObject {
         // every saved percentage checkpoint.
         usageWindowStart = snapshot.usageWindowStart
         usageWindowDurationMinutes = snapshot.windowDurationMinutes
-        usedPercent = max(
-            snapshot.usedPercent,
-            usageHistory.last(where: {
-                abs($0.windowStart.timeIntervalSince(snapshot.usageWindowStart))
-                    < UsageHistoryStore.windowTolerance
-            })?.usedPercent ?? 0
-        )
+        // The primary dial, menu bar, phone snapshot, and pace chart must all
+        // use Codex's authoritative quota value. Token-derived projection is
+        // reserved for the fractional Live Activity display; promoting it here
+        // can make every primary surface jump by the estimator's full cap when
+        // a large local ledger gap catches up.
+        usedPercent = snapshot.usedPercent
         weekElapsedPercent = snapshot.weekElapsedPercent
         lastUpdated = recordedAt
         codexStatus = isLive
             ? "Live · \(snapshot.planName) plan"
             : "Cached · \(snapshot.planName) plan"
+        publishMenuBarSummary()
         publishMobileSnapshot()
     }
 
-    func publishMobileSnapshot() {
-        let defaults = UserDefaults.standard
-        let renewalTimestamp = defaults.double(forKey: BillingDefaults.renewalTimestamp)
-        let renewalDate = renewalTimestamp > 0 ? Date(timeIntervalSince1970: renewalTimestamp) : nil
-        let selectedSource = ForecastSource(
-            rawValue: defaults.string(forKey: ForecastSource.defaultsKey) ?? ""
-        ) ?? forecastSnapshot?.source ?? .average
+    func publishMenuBarSummary() {
+        let primary = usedPercent.flatMap { used in
+            resetAt.map { reset in
+                MenuBarQuotaWindow(
+                    id: "primary",
+                    label: "Codex",
+                    usedPercent: used,
+                    resetAt: reset,
+                    durationMinutes: usageWindowDurationMinutes ?? 0
+                )
+            }
+        }
+        let secondary = secondaryQuota.map {
+            MenuBarQuotaWindow(
+                id: "secondary",
+                label: "Codex",
+                usedPercent: $0.usedPercent,
+                resetAt: $0.resetAt,
+                durationMinutes: $0.windowDurationMinutes
+            )
+        }
+        let inventory = quotaInventory.map {
+            MenuBarQuotaWindow(
+                id: $0.id,
+                label: $0.label,
+                usedPercent: $0.usedPercent,
+                resetAt: $0.resetAt,
+                durationMinutes: $0.windowDurationMinutes
+            )
+        }
         let pace = UsagePace.calculate(
             usedPercent: usedPercent,
             windowStartDate: usageWindowStart,
@@ -1158,9 +2075,58 @@ final class DashboardModel: ObservableObject {
             usageHistory: usageHistory,
             localTokensTotal: localTokensTotal,
             localTokenPace: localTokenPace,
+            usageIntelligence: usageIntelligence,
+            rate: .oneHour
+        )
+        let range = forecastSnapshot?.range.map {
+            "RANGE \(Int($0.lowerBound.rounded()))–\(Int($0.upperBound.rounded()))%"
+        }
+        MenuBarSummaryModel.shared.update(
+            MenuBarSummaryPayload(
+                primary: primary,
+                secondary: secondary,
+                inventory: inventory,
+                planName: planName,
+                paceHeadline: pace.title,
+                paceRunout: pace.estimatedRunout,
+                forecastPercent: forecastPercent,
+                forecastRange: range,
+                expectedResetAt: resetAnnouncement == nil ? nil : resetLifecycle.activeExpectedAt(),
+                resetIsDelayed: resetAnnouncement != nil && resetLifecycle.isDelayed(),
+                lastBlessingAt: resetIntel?.lastBlessingAt,
+                unreadTweet: newTweetAlert != nil,
+                lastSuccessfulAt: lastCodexSuccessfulAt,
+                lastAttemptFailed: lastCodexAttemptFailed,
+                statusMessage: codexStatus
+            )
+        )
+    }
+
+    func publishMobileSnapshot() {
+        let defaults = UserDefaults.standard
+        let renewalTimestamp = defaults.double(forKey: BillingDefaults.renewalTimestamp)
+        let renewalDate = renewalTimestamp > 0 ? Date(timeIntervalSince1970: renewalTimestamp) : nil
+        let selectedSources = ForecastSourceSelection.load(from: defaults)
+        let selectedSource = selectedSources.count == 1
+            ? selectedSources.first!
+            : .average
+        let pace = UsagePace.calculate(
+            usedPercent: usedPercent,
+            windowStartDate: usageWindowStart,
+            resetAt: resetAt,
+            usageHistory: usageHistory,
+            localTokensTotal: localTokensTotal,
+            localTokenPace: localTokenPace,
+            usageIntelligence: usageIntelligence,
             rate: .oneHour
         )
         let announcement = resetAnnouncement
+        let sourceAnnouncement = forecastSnapshot?.announcement
+        let applicabilityResponse = sourceAnnouncement.flatMap { source -> ResetApplicabilityResponse? in
+            guard let response = ResetApplicability.load(),
+                  response.announcementID == source.id else { return nil }
+            return response
+        }
         let mobileHistory = mobileUsageHistory(now: Date())
         let snapshot = MobileQuotaSnapshot(
             capturedAt: Date(),
@@ -1170,11 +2136,18 @@ final class DashboardModel: ObservableObject {
             resetAt: resetAt,
             usageWindowStart: usageWindowStart,
             windowDurationMinutes: usageWindowDurationMinutes,
-            weeklyTokens: weeklyTokens,
+            // The ledger includes cached input, cache writes, output, and
+            // reasoning tokens. That is the cumulative number the pace UI
+            // promises, so prefer it over the narrower account usage bucket.
+            weeklyTokens: max(weeklyTokens ?? 0, usageIntelligence?.tokens.total ?? 0),
             planName: defaults.string(forKey: BillingDefaults.webPlanName) ?? planName,
             renewalDate: renewalDate,
             selectedSource: selectedSource.rawValue,
-            providers: (forecastSnapshot?.providers ?? []).map {
+            selectedSources: ForecastSource.calculatorCases
+                .filter(selectedSources.contains)
+                .map(\.rawValue),
+            providers: (forecastSnapshot?.providers ?? [])
+                .map {
                 MobileProviderReading(
                     source: $0.source.rawValue,
                     percent: $0.score,
@@ -1182,11 +2155,15 @@ final class DashboardModel: ObservableObject {
                 )
             },
             resetAnnounced: announcement?.isActive() == true,
-            announcementID: announcement?.id,
-            announcementText: announcement?.text,
-            announcementDate: announcement?.detectedAt,
-            announcementExpectedAt: forecastSnapshot?.scheduledReset?.expectedAt ?? announcement?.expectedAt,
-            announcementURL: announcement?.url,
+            announcementID: sourceAnnouncement?.id,
+            announcementText: sourceAnnouncement?.text,
+            announcementDate: sourceAnnouncement?.detectedAt,
+            announcementExpectedAt: announcement == nil ? nil : resetLifecycle.expectedAt,
+            announcementRequiresApplicabilityConfirmation: sourceAnnouncement?.requiresApplicabilityConfirmation,
+            announcementAppliesToAccount: applicabilityResponse?.applies,
+            announcementApplicabilityAnsweredAt: applicabilityResponse?.answeredAt,
+            resetCompletedAt: resetLifecycle.completedAt,
+            announcementURL: sourceAnnouncement?.url,
             lastBlessingAt: resetIntel?.lastBlessingAt,
             resetCreditExpiresAt: resetDeadlineIsCredit ? resetAt : nil,
             estimatedRunoutAt: pace.projectedExhaustion,
@@ -1200,6 +2177,75 @@ final class DashboardModel: ObservableObject {
                     twelveHours: $0.twelveHours,
                     twentyFourHours: $0.twentyFourHours,
                     sinceReset: $0.sinceReset
+                )
+            },
+            usageIntelligence: usageIntelligence.map {
+                let input = $0.tokens.uncachedInput + $0.tokens.cachedInput + $0.tokens.cacheWriteInput
+                return MobileUsageIntelligence(
+                    apiEquivalentUSD: $0.apiEquivalentUSD,
+                    quotaWeightedUSD: $0.quotaWeightedUSD,
+                    pricingCoverage: $0.pricingCoverage,
+                    speedCoverage: $0.speedCoverage,
+                    fastShare: $0.fastShare,
+                    eventCount: $0.eventCount,
+                    ledgerBytes: $0.ledgerBytes,
+                    topModel: $0.modelSummaries.first?.model,
+                    totalTokens: $0.tokens.total,
+                    cacheHitRate: input > 0 ? Double($0.tokens.cachedInput) / Double(input) : nil,
+                    costTimeline: $0.costTimeline.map {
+                        MobileCostPoint(date: $0.date, apiEquivalentUSD: $0.apiEquivalentUSD)
+                    }
+                )
+            },
+            secondaryQuota: secondaryQuota.map {
+                MobileSecondaryQuota(
+                    usedPercent: $0.usedPercent,
+                    resetAt: $0.resetAt,
+                    windowDurationMinutes: $0.windowDurationMinutes
+                )
+            },
+            quotaInventory: quotaInventory.map {
+                MobileQuotaWindow(
+                    id: $0.id,
+                    label: $0.label,
+                    scope: $0.scope,
+                    usedPercent: $0.usedPercent,
+                    resetAt: $0.resetAt,
+                    windowDurationMinutes: $0.windowDurationMinutes
+                )
+            },
+            creditSummary: creditSummary.map {
+                MobileCreditSummary(hasCredits: $0.hasCredits, unlimited: $0.unlimited, balance: $0.balance)
+            },
+            resetCredits: resetCredits.map {
+                MobileResetCredit(
+                    id: $0.id,
+                    resetType: $0.resetType,
+                    status: $0.status,
+                    expiresAt: $0.expiresAt,
+                    description: $0.description
+                )
+            },
+            activeTasks: activeTasks.map {
+                MobileCodexTask(id: $0.id, name: $0.name, state: $0.state, source: $0.source, updatedAt: $0.updatedAt)
+            },
+            weeklyArchives: weeklyArchives.map {
+                MobileWeeklyArchive(
+                    windowStart: $0.windowStart,
+                    resetAt: $0.resetAt,
+                    finalUsedPercent: $0.finalUsedPercent,
+                    totalTokens: $0.totalTokens,
+                    apiEquivalentUSD: $0.apiEquivalentUSD,
+                    cacheHitRate: $0.cacheHitRate,
+                    fastShare: $0.fastShare,
+                    topModel: $0.modelSummaries.first?.model,
+                    points: $0.points.map {
+                        MobileWeeklyArchivePoint(
+                            date: $0.date,
+                            usedPercent: $0.usedPercent,
+                            apiEquivalentUSD: $0.apiEquivalentUSD
+                        )
+                    }
                 )
             },
             tiboPosts: (resetIntel?.tweets ?? [])
@@ -1262,6 +2308,41 @@ final class DashboardModel: ObservableObject {
                 tokens: tokens > 0 ? tokens : nil
             )
         })
+
+        // Account usage buckets and the local ledger count different token
+        // categories. Rescale the cumulative history to the ledger's complete
+        // total so the phone does not show a smaller number in the chart than
+        // in the intelligence header, while preserving the observed curve.
+        if let ledgerTotal = usageIntelligence?.tokens.total,
+           ledgerTotal > 0,
+           let reportedTotal = result.compactMap(\.tokens).max(),
+           reportedTotal > 0 {
+            let scale = Double(ledgerTotal) / Double(reportedTotal)
+            result = result.map { point in
+                MobileUsagePoint(
+                    date: point.date,
+                    usedPercent: point.usedPercent,
+                    tokens: point.tokens.map { Int64((Double($0) * scale).rounded()) }
+                )
+            }
+        }
+
+        if let usedPercent {
+            let currentTokens = max(
+                result.compactMap(\.tokens).max() ?? 0,
+                usageIntelligence?.tokens.total ?? 0
+            )
+            let current = MobileUsagePoint(
+                date: now,
+                usedPercent: usedPercent,
+                tokens: currentTokens > 0 ? currentTokens : nil
+            )
+            if let last = result.last, now.timeIntervalSince(last.date) < 30 {
+                result[result.count - 1] = current
+            } else {
+                result.append(current)
+            }
+        }
         return result
     }
 
@@ -1269,6 +2350,7 @@ final class DashboardModel: ObservableObject {
         guard let newTweetAlert else { return }
         UserDefaults.standard.set(newTweetAlert.alertIdentity, forKey: clearedTweetKey)
         self.newTweetAlert = nil
+        publishMenuBarSummary()
     }
 
     private func updateTweetAlert(from tweets: [TiboTweet]) {
@@ -1279,24 +2361,42 @@ final class DashboardModel: ObservableObject {
             .map(TiboTweet.canonicalizeStoredIdentity)
         let clearedID = defaults.string(forKey: clearedTweetKey)
             .map(TiboTweet.canonicalizeStoredIdentity)
-        let identity = newest.alertIdentity
+        let existing = defaults.stringArray(forKey: observedTweetsKey)
+        var seen = Set(existing ?? [])
+        if let observedID { seen.insert(observedID) }
+        if let clearedID { seen.insert(clearedID) }
+        let savedTimestamp = defaults.double(forKey: tweetWatermarkKey)
+        let watermark = savedTimestamp > 0 ? Date(timeIntervalSince1970: savedTimestamp) : nil
 
-        if observedID == nil {
-            // Seed the baseline silently on first launch. The bubble is for a
-            // tweet that arrives after the widget has started watching.
-            defaults.set(identity, forKey: observedTweetKey)
-            defaults.set(identity, forKey: clearedTweetKey)
-            return
+        // A mirror can discover yesterday's post after another provider has
+        // already shown it. Notify only for an unseen identity newer than the
+        // newest posted time we have observed, never because feed order moved.
+        let candidate: TiboTweet? = existing == nil ? nil : tweets
+            .filter { tweet in
+                guard !seen.contains(tweet.alertIdentity), let date = tweet.date else { return false }
+                return watermark.map { date > $0 } ?? true
+            }
+            .max { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+
+        let currentIdentities = tweets.map(\.alertIdentity)
+        let currentSet = Set(currentIdentities)
+        let history = currentIdentities + seen.filter { !currentSet.contains($0) }
+        defaults.set(Array(history.prefix(256)), forKey: observedTweetsKey)
+        defaults.set(newest.alertIdentity, forKey: observedTweetKey)
+        if let newestDate = tweets.compactMap(\.date).max() {
+            defaults.set(max(watermark ?? .distantPast, newestDate).timeIntervalSince1970, forKey: tweetWatermarkKey)
         }
 
-        if observedID != identity {
-            defaults.set(identity, forKey: observedTweetKey)
+        if existing == nil {
+            // Upgrade migration: everything already in the feed is baseline.
+            defaults.set(newest.alertIdentity, forKey: clearedTweetKey)
+            return
         }
 
         // Do not clear this automatically when the source refreshes or the
         // app relaunches. It remains visible until the user taps the check.
-        if clearedID != identity {
-            newTweetAlert = newest
+        if let candidate, clearedID != candidate.alertIdentity {
+            newTweetAlert = candidate
         }
     }
 }
@@ -1308,11 +2408,49 @@ struct CodexSnapshot: Codable, Sendable {
     let weeklyTokens: Int64
     let localTokensTotal: Int64?
     let localTokenPace: LocalTokenPaceSnapshot?
+    let usageIntelligence: UsageIntelligenceSnapshot?
+    let secondaryQuota: SecondaryQuotaSnapshot?
+    let quotaInventory: [CodexQuotaWindow]?
+    let creditSummary: CodexCreditSummary?
+    let resetCredits: [CodexResetCredit]?
+    let activeTasks: [CodexTaskSnapshot]?
     let usageDays: [UsageDay]
     let usageWindowStart: Date
     let windowDurationMinutes: Double?
     let weekElapsedPercent: Double
     let planName: String
+}
+
+struct CodexQuotaWindow: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let scope: String
+    let usedPercent: Double
+    let resetAt: Date
+    let windowDurationMinutes: Double
+}
+
+struct CodexCreditSummary: Codable, Equatable, Sendable {
+    let hasCredits: Bool
+    let unlimited: Bool
+    let balance: String?
+}
+
+struct CodexResetCredit: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let resetType: String
+    let status: String
+    let grantedAt: Date?
+    let expiresAt: Date?
+    let description: String?
+}
+
+struct CodexTaskSnapshot: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let name: String
+    let state: String
+    let source: String
+    let updatedAt: Date
 }
 
 struct UsageDay: Codable, Identifiable, Sendable {
@@ -1322,7 +2460,7 @@ struct UsageDay: Codable, Identifiable, Sendable {
     var id: Date { date }
 }
 
-struct LocalTokenPaceSnapshot: Codable, Sendable {
+struct LocalTokenPaceSnapshot: Codable, Equatable, Sendable {
     let fiveMinutes: Int64
     let oneHour: Int64
     let twelveHours: Int64
@@ -1351,11 +2489,13 @@ struct UsageCheckpoint: Codable, Identifiable, Sendable {
     let weeklyTokens: Int64
     let localTokensTotal: Int64?
     let rollingFiveMinuteTokens: Int64?
+    let apiEquivalentUSD: Double?
+    let quotaWeightedUSD: Double?
 
     var id: Date { recordedAt }
 }
 
-private enum UsageHistoryStore {
+enum UsageHistoryStore {
     private static let legacyDefaultsKey = "QuotaGlance.usageCheckpoints.v1"
     // Codex can revise an inferred weekly deadline as expiring sub-windows
     // disappear. Keep those readings in one real quota window while remaining
@@ -1403,6 +2543,13 @@ private enum UsageHistoryStore {
         return []
     }
 
+    static func purge() {
+        for url in [historyURL, backupURL] where FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        UserDefaults.standard.removeObject(forKey: legacyDefaultsKey)
+    }
+
     static func record(_ checkpoint: UsageCheckpoint) -> [UsageCheckpoint] {
         var checkpoints = load()
         let now = checkpoint.recordedAt
@@ -1440,7 +2587,9 @@ private enum UsageHistoryStore {
             usedPercent: stablePercent,
             weeklyTokens: checkpoint.weeklyTokens > 0 ? checkpoint.weeklyTokens : lastKnownTokens,
             localTokensTotal: stableLocalTokens,
-            rollingFiveMinuteTokens: checkpoint.rollingFiveMinuteTokens
+            rollingFiveMinuteTokens: checkpoint.rollingFiveMinuteTokens,
+            apiEquivalentUSD: max(checkpoint.apiEquivalentUSD ?? 0, mostRecent?.apiEquivalentUSD ?? 0),
+            quotaWeightedUSD: max(checkpoint.quotaWeightedUSD ?? 0, mostRecent?.quotaWeightedUSD ?? 0)
         )
 
         let shouldPersist: Bool
@@ -1477,7 +2626,9 @@ private enum UsageHistoryStore {
             usedPercent: 0,
             weeklyTokens: 0,
             localTokensTotal: nil,
-            rollingFiveMinuteTokens: nil
+            rollingFiveMinuteTokens: nil,
+            apiEquivalentUSD: nil,
+            quotaWeightedUSD: nil
         )
         return load().last(where: { isSameWindow($0, as: probe) })?.windowStart ?? proposedStart
     }
@@ -1491,7 +2642,9 @@ private enum UsageHistoryStore {
             usedPercent: 0,
             weeklyTokens: 0,
             localTokensTotal: nil,
-            rollingFiveMinuteTokens: nil
+            rollingFiveMinuteTokens: nil,
+            apiEquivalentUSD: nil,
+            quotaWeightedUSD: nil
         )
         return load().filter { isSameWindow($0, as: probe) }.count
     }
@@ -1683,6 +2836,12 @@ private enum CodexSnapshotStore {
             weeklyTokens: max(previous.weeklyTokens, incoming.weeklyTokens),
             localTokensTotal: maxOptional(previous.localTokensTotal, incoming.localTokensTotal),
             localTokenPace: pace,
+            usageIntelligence: incoming.usageIntelligence ?? previous.usageIntelligence,
+            secondaryQuota: incoming.secondaryQuota ?? previous.secondaryQuota,
+            quotaInventory: incoming.quotaInventory ?? previous.quotaInventory,
+            creditSummary: incoming.creditSummary ?? previous.creditSummary,
+            resetCredits: incoming.resetCredits ?? previous.resetCredits,
+            activeTasks: incoming.activeTasks ?? previous.activeTasks,
             usageDays: days,
             usageWindowStart: previous.usageWindowStart,
             windowDurationMinutes: incoming.windowDurationMinutes ?? previous.windowDurationMinutes,
@@ -1754,7 +2913,8 @@ enum CodexService {
             #"{"method":"initialize","id":0,"params":{"clientInfo":{"name":"quota_glance","title":"Quota Glance","version":"1.0.0"}}}"#,
             #"{"method":"initialized","params":{}}"#,
             #"{"method":"account/rateLimits/read","id":1}"#,
-            #"{"method":"account/usage/read","id":2}"#
+            #"{"method":"account/usage/read","id":2}"#,
+            #"{"method":"thread/list","id":3,"params":{"limit":30,"archived":false,"sortKey":"updated_at","sortDirection":"desc","useStateDbOnly":true}}"#
         ].joined(separator: "\n") + "\n"
         input.fileHandleForWriting.write(Data(messages.utf8))
         // The account endpoints are asynchronous. Keep stdin alive briefly so the
@@ -1767,6 +2927,7 @@ enum CodexService {
 
         var rateResult: [String: Any]?
         var usageResult: [String: Any]?
+        var threadResult: [String: Any]?
         for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
             guard
                 let lineData = line.data(using: .utf8),
@@ -1776,6 +2937,7 @@ enum CodexService {
             else { continue }
             if id == 1 { rateResult = result }
             if id == 2 { usageResult = result }
+            if id == 3 { threadResult = result }
         }
 
         guard
@@ -1800,12 +2962,30 @@ enum CodexService {
         let usageDays = dailyUsageSince(windowStartDate, usageResult: usageResult)
         let weeklyTokens = usageDays.reduce(Int64(0)) { $0 + $1.tokens }
         let localTokensTotal = localCodexTokenTotal()
+        let usageIntelligence = UsageIntelligenceStore.refresh(windowStart: windowStartDate)
         let localTokenPace = localTokenPaceSnapshot(
             windowStart: windowStartDate,
             now: Date(),
-            currentTotal: localTokensTotal
+            currentTotal: localTokensTotal,
+            ledgerPace: usageIntelligence.recentTokenPace
         )
+        let secondaryQuota: SecondaryQuotaSnapshot? = {
+            guard let secondary = rateLimits["secondary"] as? [String: Any],
+                  let used = number(secondary["usedPercent"] ?? secondary["used_percent"]),
+                  let secondaryReset = number(secondary["resetsAt"] ?? secondary["resets_at"]),
+                  let secondaryDuration = number(secondary["windowDurationMins"] ?? secondary["window_minutes"])
+            else { return nil }
+            return SecondaryQuotaSnapshot(
+                usedPercent: max(0, min(100, used)),
+                resetAt: Date(timeIntervalSince1970: secondaryReset),
+                windowDurationMinutes: secondaryDuration
+            )
+        }()
         let plan = displayPlanName(rateLimits["planType"] as? String)
+        let quotaInventory = quotaWindows(from: rateResult)
+        let creditSummary = creditSummary(from: rateLimits["credits"] as? [String: Any])
+        let resetCredits = resetCredits(from: rateResult)
+        let activeTasks = activeTasks(from: threadResult)
 
         return CodexSnapshot(
             usedPercent: usedPercent,
@@ -1814,6 +2994,12 @@ enum CodexService {
             weeklyTokens: weeklyTokens,
             localTokensTotal: localTokensTotal,
             localTokenPace: localTokenPace,
+            usageIntelligence: usageIntelligence,
+            secondaryQuota: secondaryQuota,
+            quotaInventory: quotaInventory,
+            creditSummary: creditSummary,
+            resetCredits: resetCredits,
+            activeTasks: activeTasks,
             usageDays: usageDays,
             // Pace analysis follows the actual Codex usage window. The orange
             // dial can still use its separate seven-day visual baseline.
@@ -1826,6 +3012,85 @@ enum CodexService {
 
     private static func number(_ value: Any?) -> Double? {
         (value as? NSNumber)?.doubleValue
+    }
+
+    private static func quotaWindows(from result: [String: Any]?) -> [CodexQuotaWindow] {
+        guard let byID = result?["rateLimitsByLimitId"] as? [String: Any] else { return [] }
+        var windows: [CodexQuotaWindow] = []
+        for (limitID, raw) in byID {
+            guard let limit = raw as? [String: Any] else { continue }
+            let label = (limit["limitName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let display = (label?.isEmpty == false ? label! : limitID == "codex" ? "Codex" : limitID)
+            for (key, scope) in [("primary", "Short window"), ("secondary", "Weekly window")] {
+                guard let window = limit[key] as? [String: Any],
+                      let used = number(window["usedPercent"] ?? window["used_percent"]),
+                      let reset = number(window["resetsAt"] ?? window["resets_at"]),
+                      let minutes = number(window["windowDurationMins"] ?? window["window_minutes"])
+                else { continue }
+                windows.append(CodexQuotaWindow(
+                    id: limitID + "." + key,
+                    label: display,
+                    scope: scope,
+                    usedPercent: max(0, min(100, used)),
+                    resetAt: Date(timeIntervalSince1970: reset),
+                    windowDurationMinutes: minutes
+                ))
+            }
+        }
+        return windows.sorted {
+            if $0.label != $1.label { return $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+            return $0.windowDurationMinutes < $1.windowDurationMinutes
+        }
+    }
+
+    private static func creditSummary(from value: [String: Any]?) -> CodexCreditSummary? {
+        guard let value else { return nil }
+        let has = value["hasCredits"] as? Bool ?? false
+        let unlimited = value["unlimited"] as? Bool ?? false
+        let balance = value["balance"].map { String(describing: $0) }
+        return CodexCreditSummary(hasCredits: has, unlimited: unlimited, balance: balance)
+    }
+
+    private static func resetCredits(from result: [String: Any]?) -> [CodexResetCredit] {
+        guard let container = result?["rateLimitResetCredits"] as? [String: Any],
+              let credits = container["credits"] as? [[String: Any]] else { return [] }
+        return credits.compactMap { credit in
+            guard let id = credit["id"] as? String,
+                  let type = credit["resetType"] as? String,
+                  let status = credit["status"] as? String else { return nil }
+            return CodexResetCredit(
+                id: id,
+                resetType: type,
+                status: status,
+                grantedAt: number(credit["grantedAt"]).map(Date.init(timeIntervalSince1970:)),
+                expiresAt: number(credit["expiresAt"]).map(Date.init(timeIntervalSince1970:)),
+                description: credit["description"] as? String
+            )
+        }.sorted { ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture) }
+    }
+
+    private static func activeTasks(from result: [String: Any]?) -> [CodexTaskSnapshot] {
+        guard let threads = result?["data"] as? [[String: Any]] else { return [] }
+        return threads.compactMap { thread in
+            guard let id = thread["id"] as? String,
+                  let updated = number(thread["updatedAt"] ?? thread["updated_at"])
+            else { return nil }
+            let rolloutIsActive = (thread["path"] as? String).map {
+                CodexActivityProbe.isTurnActive(rolloutURL: URL(fileURLWithPath: $0))
+            } ?? false
+            // Loaded/open threads are not necessarily doing work. Only a rollout with
+            // an active turn should keep the phone Live Activity alive.
+            let updatedAt = Date(timeIntervalSince1970: updated)
+            guard rolloutIsActive, Date().timeIntervalSince(updatedAt) <= 10 * 60 else { return nil }
+            let rawName = (thread["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return CodexTaskSnapshot(
+                id: id,
+                name: rawName?.isEmpty == false ? rawName! : "Codex task",
+                state: "active",
+                source: (thread["source"] as? String) ?? "Codex",
+                updatedAt: updatedAt
+            )
+        }
     }
 
     private static func displayPlanName(_ rawValue: String?) -> String {
@@ -1870,29 +3135,35 @@ enum CodexService {
     private static func localTokenPaceSnapshot(
         windowStart: Date,
         now: Date,
-        currentTotal: Int64?
+        currentTotal: Int64?,
+        ledgerPace: LocalTokenPaceSnapshot?
     ) -> LocalTokenPaceSnapshot? {
-        guard let currentTotal else { return nil }
+        guard currentTotal != nil || ledgerPace != nil else { return nil }
         let intervals: [TimeInterval] = [5 * 60, 60 * 60, 12 * 60 * 60, 24 * 60 * 60]
-        let totals = intervals.map {
-            UsageHistoryStore.localTokenBurn(
-                currentTotal: currentTotal,
-                windowStart: windowStart,
-                now: now,
-                interval: $0
+        let databaseTotals = intervals.map { interval -> Int64 in
+            guard let currentTotal else { return 0 }
+            return UsageHistoryStore.localTokenBurn(
+                currentTotal: currentTotal, windowStart: windowStart, now: now, interval: interval
             )
         }
+        let totals = [
+            max(databaseTotals[0], ledgerPace?.fiveMinutes ?? 0),
+            max(databaseTotals[1], ledgerPace?.oneHour ?? 0),
+            max(databaseTotals[2], ledgerPace?.twelveHours ?? 0),
+            max(databaseTotals[3], ledgerPace?.twentyFourHours ?? 0)
+        ]
 
         let sinceReset: Int64 = {
-            if let persisted = LocalTokenBaselineStore.tokensSinceReset(
+            if let currentTotal,
+               let persisted = LocalTokenBaselineStore.tokensSinceReset(
                     windowStart: windowStart,
                     currentTotal: currentTotal
                ) {
-                return persisted
+                return max(persisted, ledgerPace?.sinceReset ?? 0)
             }
             // On the first sample of a new quota window, seed from the oldest
             // retained checkpoint. Future five-minute samples remain exact.
-            return totals[3]
+            return max(totals[3], ledgerPace?.sinceReset ?? 0)
         }()
 
         return LocalTokenPaceSnapshot(
@@ -1966,8 +3237,10 @@ enum CodexService {
 
 struct ForecastSnapshot: Sendable {
     let score: Double
+    let baselineScore: Double
     let displayLabel: String?
     let source: ForecastSource
+    let selectedSources: Set<ForecastSource>
     let announcement: ResetAnnouncement?
     let scheduledReset: ResetSchedule?
     let intel: ResetIntelSnapshot?
@@ -1993,6 +3266,10 @@ struct ResetAnnouncement: Sendable, Equatable {
     let text: String
     let url: URL?
 
+    var requiresApplicabilityConfirmation: Bool {
+        ResetApplicability.requiresConfirmation(text)
+    }
+
     func isActive(at date: Date = Date()) -> Bool {
         let expiresAt = expectedAt?.addingTimeInterval(3 * 3_600)
             ?? detectedAt.addingTimeInterval(36 * 3_600)
@@ -2006,13 +3283,9 @@ enum ResetAnnouncementTimeParser {
             .replacingOccurrences(of: "a.m.", with: "am", options: .caseInsensitive)
             .replacingOccurrences(of: "p.m.", with: "pm", options: .caseInsensitive)
 
-        if let relative = relativeExpectedDate(in: normalized, postedAt: postedAt) {
-            return relative
-        }
-
         guard
             let expression = try? NSRegularExpression(
-                pattern: #"\b([0-2]?\d)(?::([0-5]\d))?\s*(am|pm)?\s*(PST|PDT|PT|MST|MDT|MT|CST|CDT|CT|EST|EDT|ET|UTC|GMT)?\b"#,
+                pattern: #"\b([0-2]?\d)(?::([0-5]\d))?\s*(am|pm)?\s*(PST|PDT|PT|Pacific(?:\s+Time)?|MST|MDT|MT|Mountain(?:\s+Time)?|CST|CDT|CT|Central(?:\s+Time)?|EST|EDT|ET|Eastern(?:\s+Time)?|UTC|GMT)?\b"#,
                 options: [.caseInsensitive]
             )
         else { return nil }
@@ -2033,8 +3306,6 @@ enum ResetAnnouncementTimeParser {
 
             let minute = Range(match.range(at: 2), in: normalized)
                 .flatMap { Int(normalized[$0]) } ?? 0
-            guard var hour = normalizedHour(rawHour, meridiem: meridiem) else { continue }
-            hour = min(23, hour)
             let sourceZone = timeZone(for: zoneToken)
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = sourceZone
@@ -2047,29 +3318,35 @@ enum ResetAnnouncementTimeParser {
             else if lower.contains("today") || lower.contains("tonight") { dayOffset = 0 }
             else { dayOffset = 0 }
             guard let targetDay = calendar.date(byAdding: .day, value: dayOffset, to: postedDay) else { continue }
-            var components = calendar.dateComponents([.year, .month, .day], from: targetDay)
-            components.hour = hour
-            components.minute = minute
-            components.second = 0
-            guard var candidate = calendar.date(from: components) else { continue }
-            if dayOffset == 0, !lower.contains("today"), !lower.contains("tonight"), candidate < postedAt {
-                candidate = calendar.date(byAdding: .day, value: 1, to: candidate) ?? candidate
+
+            let possibleHours: [Int]
+            if meridiem == nil, rawHour <= 12, zoneToken != nil {
+                // “4:30 Central” is common in replies. Choose the next 4:30
+                // on that named-zone day, which correctly resolves to PM when
+                // the post was made during the afternoon.
+                let morning = rawHour == 12 ? 0 : rawHour
+                possibleHours = [morning, morning + 12]
+            } else if let hour = normalizedHour(rawHour, meridiem: meridiem) {
+                possibleHours = [min(23, hour)]
+            } else {
+                continue
             }
-            return candidate
+
+            let candidates = possibleHours.compactMap { hour -> Date? in
+                var components = calendar.dateComponents([.year, .month, .day], from: targetDay)
+                components.hour = hour
+                components.minute = minute
+                components.second = 0
+                return calendar.date(from: components)
+            }.sorted()
+            if dayOffset > 0 { return candidates.first }
+            if let upcoming = candidates.first(where: { $0 >= postedAt }) { return upcoming }
+            if lower.contains("today") || lower.contains("tonight") { continue }
+            if let first = candidates.first {
+                return calendar.date(byAdding: .day, value: 1, to: first) ?? first
+            }
         }
         return nil
-    }
-
-    private static func relativeExpectedDate(in text: String, postedAt: Date) -> Date? {
-        guard let expression = try? NSRegularExpression(
-            pattern: #"(?:in|within|over(?:\s+the)?|next)\s+(?:(\d+)\s*)?(minutes?|mins?|hours?|hrs?)"#,
-            options: [.caseInsensitive]
-        ), let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-           let unitRange = Range(match.range(at: 2), in: text)
-        else { return nil }
-        let amount = Range(match.range(at: 1), in: text).flatMap { Double(text[$0]) } ?? 1
-        let unit = text[unitRange].lowercased()
-        return postedAt.addingTimeInterval(amount * (unit.hasPrefix("h") ? 3_600 : 60))
     }
 
     private static func normalizedHour(_ rawHour: Int, meridiem: String?) -> Int? {
@@ -2085,9 +3362,9 @@ enum ResetAnnouncementTimeParser {
     private static func timeZone(for token: String?) -> TimeZone {
         let identifier: String
         switch token {
-        case "MST", "MDT", "MT": identifier = "America/Denver"
-        case "CST", "CDT", "CT": identifier = "America/Chicago"
-        case "EST", "EDT", "ET": identifier = "America/New_York"
+        case "MST", "MDT", "MT", "MOUNTAIN", "MOUNTAIN TIME": identifier = "America/Denver"
+        case "CST", "CDT", "CT", "CENTRAL", "CENTRAL TIME": identifier = "America/Chicago"
+        case "EST", "EDT", "ET", "EASTERN", "EASTERN TIME": identifier = "America/New_York"
         case "UTC", "GMT": identifier = "UTC"
         default: identifier = "America/Los_Angeles"
         }
@@ -2102,6 +3379,20 @@ struct ResetMetric: Identifiable, Sendable {
     let detail: String?
 }
 
+struct PolymarketResetHedge: Sendable, Equatable {
+    static let targetPayout = 80.0
+
+    let marketLabel: String
+    let deadline: Date
+    let yesPrice: Double
+    let noPrice: Double
+    let url: URL
+
+    var shares: Double { Self.targetPayout }
+    var stake: Double { shares * noPrice }
+    var grossProfit: Double { Self.targetPayout - stake }
+}
+
 struct ResetProviderSnapshot: Identifiable, Sendable {
     var id: ForecastSource { source }
     let source: ForecastSource
@@ -2114,7 +3405,11 @@ struct ResetProviderSnapshot: Identifiable, Sendable {
     let metrics: [ResetMetric]
     let signals: [ResetMetric]
     let updatedAt: Date?
+    /// A provider's probability window (for example “95% by 2 AM”). This is
+    /// intentionally separate from an official reset announcement.
+    let forecastDeadline: Date?
     let announcement: ResetAnnouncement?
+    let polymarketHedge: PolymarketResetHedge?
 }
 
 struct TiboTweet: Identifiable, Sendable {
@@ -2217,30 +3512,42 @@ struct ResetIntelSnapshot: Sendable {
     }
 }
 
+struct CodexResetsWatchSignal: Sendable {
+    let score: Double
+    let displayLabel: String?
+    let expectedAt: Date?
+    let yesVotes: Int?
+    let noVotes: Int?
+    let tweets: [TiboTweet]
+}
+
 enum ForecastService {
     static func fetch() async throws -> ForecastSnapshot {
-        let selected = ForecastSource(
-            rawValue: UserDefaults.standard.string(forKey: ForecastSource.defaultsKey) ?? ""
-        ) ?? .lunarWerx
+        let selected = ForecastSourceSelection.load()
 
         async let lunar = optionalProvider(.lunarWerx)
         async let current = optionalProvider(.codexResets)
         async let original = optionalProvider(.willCodexQuotaReset)
         async let fallback = optionalProvider(.gussuri)
-        let providers = await [lunar, current, original, fallback].compactMap { $0 }
+        async let market = optionalProvider(.polymarket)
+        let providers = await [lunar, current, original, fallback, market].compactMap { $0 }
         return try snapshot(from: providers, selected: selected)
     }
 
     static func snapshot(
         from providers: [ResetProviderSnapshot],
-        selected: ForecastSource
+        selected: Set<ForecastSource>
     ) throws -> ForecastSnapshot {
-        guard !providers.isEmpty else { throw DashboardError.forecastUnavailable }
-        let scored = providers.filter { $0.score != nil }
-        let chosen = providers.first { $0.source == selected }
-        let averageScore = scored.compactMap(\.score).reduce(0, +) / Double(max(1, scored.count))
-        let estimatedScore = selected == .average ? averageScore : (chosen?.score ?? averageScore)
-        let ranges = selected == .average ? scored.compactMap(\.range) : chosen.map { [$0.range].compactMap { $0 } } ?? []
+        guard !providers.isEmpty, !selected.isEmpty else { throw DashboardError.forecastUnavailable }
+        let selectedProviders = providers.filter { selected.contains($0.source) }
+        // Selection is authoritative: every checked provider with a live
+        // percentage contributes equally to the combined score.
+        let scored = selectedProviders.filter { $0.score != nil }
+        let singleSource = selected.count == 1 ? selected.first : nil
+        let chosen = singleSource.flatMap { source in providers.first { $0.source == source } }
+        let values = scored.compactMap(\.score)
+        let estimatedScore = values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+        let ranges = scored.compactMap(\.range)
         let lowerAverage = ranges.map(\.lowerBound).reduce(0, +) / Double(max(1, ranges.count))
         let upperAverage = ranges.map(\.upperBound).reduce(0, +) / Double(max(1, ranges.count))
         let combinedRange: ClosedRange<Double>? = ranges.isEmpty ? nil : lowerAverage...upperAverage
@@ -2251,8 +3558,12 @@ enum ForecastService {
             .compactMap(\.announcement)
             .filter { $0.isActive() }
             .max { $0.detectedAt < $1.detectedAt }
-        let structuredSchedules = providers.compactMap { provider -> ResetSchedule? in
-            guard let item = provider.announcement, let expectedAt = item.expectedAt else { return nil }
+        let announcementSchedules = providers.compactMap { provider -> ResetSchedule? in
+            guard let item = provider.announcement,
+                  let expectedAt = ResetAnnouncementTimeParser.expectedDate(
+                    in: item.text,
+                    postedAt: item.detectedAt
+                  ) else { return nil }
             return ResetSchedule(
                 id: item.id,
                 source: item.source,
@@ -2260,6 +3571,19 @@ enum ForecastService {
                 expectedAt: expectedAt,
                 text: item.text,
                 url: item.url
+            )
+        }
+        // A dated forecast only describes the selected source's own score.
+        // Never attach one provider's horizon to a multi-source average.
+        let forecastSchedules = (selected.count == 1 ? selectedProviders : []).compactMap { provider -> ResetSchedule? in
+            guard let expectedAt = provider.forecastDeadline, expectedAt > Date() else { return nil }
+            return ResetSchedule(
+                id: "forecast:\(provider.source.rawValue):\(expectedAt.timeIntervalSince1970)",
+                source: provider.source,
+                announcedAt: provider.updatedAt ?? Date(),
+                expectedAt: expectedAt,
+                text: provider.headline ?? "Reset forecast window",
+                url: provider.source.url
             )
         }
         let textSchedules = tweets.compactMap { tweet -> ResetSchedule? in
@@ -2277,54 +3601,77 @@ enum ForecastService {
                 url: tweet.url
             )
         }
-        let scheduledReset = (structuredSchedules + textSchedules)
-            .filter { $0.expectedAt > Date().addingTimeInterval(-5 * 60) }
+        let explicitScheduledReset = (announcementSchedules + textSchedules)
+            .filter { $0.expectedAt > Date().addingTimeInterval(-12 * 3_600) }
+            // The newest explicit statement supersedes an earlier announced
+            // time. Choosing the earliest clock time could resurrect an old
+            // missed schedule after Tibo posted a correction in a reply.
+            .max { $0.announcedAt < $1.announcedAt }
+        let scheduledReset = explicitScheduledReset ?? forecastSchedules
+            .filter { $0.expectedAt > Date() }
             .min { $0.expectedAt < $1.expectedAt }
         let announcement: ResetAnnouncement? = {
-            if let providerAnnouncement {
-                guard let scheduledReset else { return providerAnnouncement }
+            if let explicitScheduledReset {
                 return ResetAnnouncement(
-                    id: providerAnnouncement.id,
-                    source: providerAnnouncement.source,
-                    detectedAt: providerAnnouncement.detectedAt,
-                    expectedAt: scheduledReset.expectedAt,
-                    text: providerAnnouncement.text,
-                    url: providerAnnouncement.url
+                    id: "scheduled:\(explicitScheduledReset.id)",
+                    source: explicitScheduledReset.source,
+                    detectedAt: explicitScheduledReset.announcedAt,
+                    expectedAt: explicitScheduledReset.expectedAt,
+                    text: explicitScheduledReset.text,
+                    url: explicitScheduledReset.url
                 )
             }
-            guard let scheduledReset else { return nil }
+            guard let providerAnnouncement else { return nil }
+            // An announcement without a wall-clock time can still raise the
+            // reset score, but it must never create a countdown or delayed
+            // state.
             return ResetAnnouncement(
-                id: "scheduled:\(scheduledReset.id)",
-                source: scheduledReset.source,
-                detectedAt: scheduledReset.announcedAt,
-                expectedAt: scheduledReset.expectedAt,
-                text: scheduledReset.text,
-                url: scheduledReset.url
+                id: providerAnnouncement.id,
+                source: providerAnnouncement.source,
+                detectedAt: providerAnnouncement.detectedAt,
+                expectedAt: nil,
+                text: providerAnnouncement.text,
+                url: providerAnnouncement.url
             )
         }()
         let score = announcement == nil ? estimatedScore : 100
         let headline: String?
-        if let scheduledReset {
+        if let scheduledReset, announcement != nil {
             headline = "Reset expected \(scheduledReset.expectedAt.formatted(date: .abbreviated, time: .shortened))"
+        } else if let scheduledReset {
+            headline = "\(Int(estimatedScore.rounded()))% chance by \(scheduledReset.expectedAt.formatted(date: .abbreviated, time: .shortened))"
         } else if announcement != nil {
             headline = "Reset announced · use your quota now"
-        } else if selected == .average {
-            headline = "Four independent reset estimates"
-        } else if chosen?.score == nil {
-            headline = "\(selected.displayName) has no live percentage · showing the available mean"
+        } else if selected.count > 1 {
+            headline = "Averaging \(selected.count) selected reset estimates"
+        } else if let singleSource, chosen?.score == nil {
+            headline = "\(singleSource.displayName) has no live percentage"
         } else {
             headline = chosen?.headline
         }
+        let source = singleSource ?? .average
         return ForecastSnapshot(
             score: score,
-            displayLabel: announcement == nil && selected != .average ? chosen?.displayLabel : nil,
-            source: selected,
+            baselineScore: estimatedScore,
+            displayLabel: announcement == nil && singleSource != nil ? chosen?.displayLabel : nil,
+            source: source,
+            selectedSources: selected,
             announcement: announcement,
             scheduledReset: scheduledReset,
             intel: ResetIntelSnapshot(lastBlessingAt: lastBlessing, tweets: tweets),
             providers: providers,
             headline: headline,
             range: combinedRange
+        )
+    }
+
+    static func snapshot(
+        from providers: [ResetProviderSnapshot],
+        selected: ForecastSource
+    ) throws -> ForecastSnapshot {
+        try snapshot(
+            from: providers,
+            selected: selected == .average ? Set(ForecastSource.calculatorCases) : [selected]
         )
     }
 
@@ -2335,12 +3682,80 @@ enum ForecastService {
             case .codexResets: return try await fetchCodexResets()
             case .willCodexQuotaReset: return try await fetchWillCodexQuotaReset()
             case .gussuri: return try await fetchGussuri()
+            case .polymarket: return try await fetchPolymarket()
             case .average: return nil
             }
         } catch {
             NSLog("Quota Glance reset source %@ failed: %@", source.hostLabel, error.localizedDescription)
             return nil
         }
+    }
+
+    static func polymarketProvider(from data: Data, now: Date = Date()) throws -> ResetProviderSnapshot {
+        guard
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let markets = root["markets"] as? [[String: Any]],
+            let eventURL = ForecastSource.polymarket.url
+        else { throw DashboardError.forecastUnavailable }
+
+        let candidates = markets.compactMap { market -> (label: String, deadline: Date, yes: Double, no: Double)? in
+            guard
+                (market["active"] as? Bool) != false,
+                (market["closed"] as? Bool) != true,
+                let deadlineText = market["endDate"] as? String,
+                let deadline = parseISODate(deadlineText),
+                deadline > now,
+                let outcomesText = market["outcomes"] as? String,
+                let pricesText = market["outcomePrices"] as? String,
+                let outcomesData = outcomesText.data(using: .utf8),
+                let pricesData = pricesText.data(using: .utf8),
+                let outcomes = try? JSONDecoder().decode([String].self, from: outcomesData),
+                let prices = try? JSONDecoder().decode([String].self, from: pricesData),
+                let yesIndex = outcomes.firstIndex(where: { $0.caseInsensitiveCompare("yes") == .orderedSame }),
+                let noIndex = outcomes.firstIndex(where: { $0.caseInsensitiveCompare("no") == .orderedSame }),
+                prices.indices.contains(yesIndex), prices.indices.contains(noIndex),
+                let yes = Double(prices[yesIndex]), let no = Double(prices[noIndex])
+            else { return nil }
+            let label = (market["groupItemTitle"] as? String)
+                ?? deadline.formatted(date: .abbreviated, time: .omitted)
+            return (label, deadline, yes, no)
+        }
+        guard let earliest = candidates.min(by: { $0.deadline < $1.deadline }) else {
+            throw DashboardError.forecastUnavailable
+        }
+
+        let hedge = PolymarketResetHedge(
+            marketLabel: earliest.label,
+            deadline: earliest.deadline,
+            yesPrice: earliest.yes,
+            noPrice: earliest.no,
+            url: eventURL
+        )
+        let score = earliest.yes * 100
+        return ResetProviderSnapshot(
+            source: .polymarket,
+            score: score,
+            displayLabel: "\(Int(score.rounded()))% · \(earliest.label.uppercased())",
+            headline: "Market odds of a reset by \(earliest.label)",
+            range: nil,
+            lastBlessingAt: nil,
+            tweets: [],
+            metrics: [
+                ResetMetric(id: "polymarket-yes", label: "Reset by \(earliest.label)", value: percent(score), detail: "Polymarket Yes price"),
+                ResetMetric(id: "polymarket-no", label: "No reset", value: "\(Int((earliest.no * 100).rounded()))¢", detail: "Current No price")
+            ],
+            signals: [],
+            updatedAt: (root["updatedAt"] as? String).flatMap(parseISODate) ?? now,
+            forecastDeadline: earliest.deadline,
+            announcement: nil,
+            polymarketHedge: hedge
+        )
+    }
+
+    private static func fetchPolymarket() async throws -> ResetProviderSnapshot {
+        let slug = "openai-resets-codex-weekly-usage-limit-byptptpt-20260901192000000"
+        let endpoint = URL(string: "https://gamma-api.polymarket.com/events/slug/\(slug)")!
+        return try polymarketProvider(from: await fetchData(endpoint))
     }
 
     private static func fetchCodexResets() async throws -> ResetProviderSnapshot {
@@ -2365,23 +3780,46 @@ enum ForecastService {
             throw DashboardError.forecastUnavailable
         }
 
+        let watch = codexResetsWatchSignal(in: html)
         let intel = ResetIntelSnapshot(
             lastBlessingAt: lastBlessingDate(in: html),
             tweets: tiboTweets(in: html)
         )
 
+        var metrics: [ResetMetric] = []
+        if let expectedAt = watch?.expectedAt {
+            metrics.append(ResetMetric(
+                id: "codex-resets-window",
+                label: "Forecast window",
+                value: shortLocalDateTime(expectedAt),
+                detail: TimeZone.autoupdatingCurrent.abbreviation(for: expectedAt)
+            ))
+        }
+        if let yesVotes = watch?.yesVotes, let noVotes = watch?.noVotes {
+            let total = max(1, yesVotes + noVotes)
+            metrics.append(ResetMetric(
+                id: "codex-resets-community",
+                label: "Community bet",
+                value: "\(Int((Double(yesVotes) / Double(total) * 100).rounded()))% yes",
+                detail: "\(total.formatted()) votes"
+            ))
+        }
+
         return ResetProviderSnapshot(
             source: .codexResets,
-            score: parseChance(in: html)?.score,
-            displayLabel: parseChance(in: html)?.displayLabel,
-            headline: "Confirmed reset history",
+            score: watch?.score ?? parseChance(in: html)?.score,
+            displayLabel: watch?.displayLabel ?? parseChance(in: html)?.displayLabel,
+            headline: watch?.expectedAt.map { "Reset watch ends \($0.formatted(date: .abbreviated, time: .shortened))" }
+                ?? "Confirmed reset history",
             range: nil,
             lastBlessingAt: intel.lastBlessingAt,
             tweets: intel.tweets,
-            metrics: [],
+            metrics: metrics,
             signals: [],
             updatedAt: Date(),
-            announcement: codexResetsAnnouncement(in: html, tweets: intel.tweets)
+            forecastDeadline: watch?.expectedAt,
+            announcement: codexResetsAnnouncement(in: html, tweets: intel.tweets),
+            polymarketHedge: nil
         )
     }
 
@@ -2428,7 +3866,9 @@ enum ForecastService {
             metrics: Array(breakdown),
             signals: [],
             updatedAt: (root["fetchedAt"] as? String).flatMap(parseISODate),
-            announcement: announcement
+            forecastDeadline: nil,
+            announcement: announcement,
+            polymarketHedge: nil
         )
     }
 
@@ -2521,7 +3961,9 @@ enum ForecastService {
             metrics: metrics,
             signals: signalMetrics,
             updatedAt: (root["generatedAt"] as? String).flatMap(parseISODate),
-            announcement: announcement
+            forecastDeadline: nil,
+            announcement: announcement,
+            polymarketHedge: nil
         )
     }
 
@@ -2575,7 +4017,9 @@ enum ForecastService {
             metrics: metrics,
             signals: [],
             updatedAt: firstCapture(#"checkedAt":"([^"]+)""#, in: normalized).flatMap(parseISODate),
-            announcement: announcement
+            forecastDeadline: nil,
+            announcement: announcement,
+            polymarketHedge: nil
         )
     }
 
@@ -2703,7 +4147,40 @@ enum ForecastService {
         value.formatted(.number.precision(.fractionLength(1))) + "d"
     }
 
-    private static func parseChance(in html: String) -> (score: Double, displayLabel: String?)? {
+    private static func shortLocalDateTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "MMM d · h:mm a"
+        return formatter.string(from: date)
+    }
+
+    static func codexResetsWatchSignal(in html: String) -> CodexResetsWatchSignal? {
+        guard let watch = firstCapture(
+            #"(<section\s+class="[^"]*\bwatch-card\b[^"]*"[\s\S]*?</section>)"#,
+            in: html
+        ) else { return nil }
+
+        let chance = firstAttribute("aria-label", in: watch).flatMap(parseProbability)
+            ?? firstCapture(#"data-role="watch-chance"[^>]*>([^<]+)<"#, in: watch).flatMap(parseProbability)
+            ?? parseChance(in: watch)
+        guard let chance else { return nil }
+
+        let expectedAt = firstAttribute("data-expires-at", in: watch).flatMap(parseISODate)
+            ?? firstCapture(#"data-role="absolute-time"[^>]*data-datetime="([^"]+)""#, in: watch).flatMap(parseISODate)
+        let yesVotes = firstAttribute("data-yes", in: watch).flatMap(Int.init)
+        let noVotes = firstAttribute("data-no", in: watch).flatMap(Int.init)
+        return CodexResetsWatchSignal(
+            score: chance.score,
+            displayLabel: chance.displayLabel,
+            expectedAt: expectedAt,
+            yesVotes: yesVotes,
+            noVotes: noVotes,
+            tweets: codexResetsWatchTweets(in: watch)
+        )
+    }
+
+    static func parseChance(in html: String) -> (score: Double, displayLabel: String?)? {
         // The current site presents the signal in its reset-watch/Tibo banner.
         // Prefer the accessible label because it survives small markup changes
         // such as “Reset chance” replacing “24h reset chance”.
@@ -2711,6 +4188,10 @@ enum ForecastService {
             #"(<section\s+class="[^"]*\bwatch-card\b[^"]*"[\s\S]*?</section>)"#,
             in: html
         ) {
+            if let ariaLabel = firstAttribute("aria-label", in: watch),
+               let parsed = parseProbability(ariaLabel) {
+                return parsed
+            }
             if let ariaLabel = firstCapture(
                 #"<p\s+class="[^"]*\bwatch-probability\b[^"]*"[^>]*aria-label="([^"]+)""#,
                 in: watch
@@ -2795,8 +4276,11 @@ enum ForecastService {
         // is not always repeated in the announcement list, so parse that card
         // separately to avoid dropping the most recent Tibo post or its reply
         // context.
-        if let watchTweet = tiboWatchTweet(in: html) {
-            parsed.append(watchTweet)
+        if let watch = firstCapture(
+            #"(<section\s+class="[^"]*\bwatch-card\b[^"]*"[\s\S]*?</section>)"#,
+            in: html
+        ) {
+            parsed.append(contentsOf: codexResetsWatchTweets(in: watch))
         }
 
         let pattern = #"<li\s+class="[^"]*\blog-item\b[^"]*"[\s\S]*?data-datetime="([^"]+)"[\s\S]*?<p\s+class="[^"]*\blog-item-text\b[^"]*"[^>]*>([\s\S]*?)</p>[\s\S]*?<a\s+class="[^"]*\blog-item-link\b[^"]*"[^>]*href="([^"]+)""#
@@ -2843,42 +4327,48 @@ enum ForecastService {
             .filter { seen.insert($0.id).inserted }
     }
 
-    private static func tiboWatchTweet(in html: String) -> TiboTweet? {
-        guard
-            let section = firstCapture(
-                #"(<section\s+class="[^"]*\bwatch-card\b[^"]*"[\s\S]*?</section>)"#,
-                in: html
-            ),
-            let textHTML = firstCapture(#"<blockquote[^>]*>([\s\S]*?)</blockquote>"#, in: section),
-            let dateText = firstAttribute("data-datetime", in: section),
-            let urlText = firstXURL(in: section)
-        else { return nil }
+    private static func codexResetsWatchTweets(in watch: String) -> [TiboTweet] {
+        guard let expression = try? NSRegularExpression(
+            pattern: #"<a\s+class="[^"]*\bwatch-tweet\b[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else { return [] }
 
-        let text = plainText(from: textHTML)
-        guard !text.isEmpty else { return nil }
-
-        let replyText = firstCapture(
-            #"<p\s+class="[^"]*\bwatch-context\b[^"]*"[^>]*>([\s\S]*?)</p>"#,
-            in: section
-        )
-        .map(plainText(from:))
-        .flatMap { value -> String? in
-            let cleaned = value.replacingOccurrences(
-                of: #"^\s*in\s+reply\s+to\s*"#,
-                with: "",
-                options: [.regularExpression, .caseInsensitive]
+        return expression.matches(in: watch, range: NSRange(watch.startIndex..., in: watch)).compactMap { match in
+            guard
+                let urlRange = Range(match.range(at: 1), in: watch),
+                let bodyRange = Range(match.range(at: 2), in: watch)
+            else { return nil }
+            let body = String(watch[bodyRange])
+            guard
+                let textHTML = firstCapture(#"<span\s+class="[^"]*\bwatch-tweet-text\b[^"]*"[^>]*>([\s\S]*?)</span>"#, in: body)
+            else { return nil }
+            let text = plainText(from: textHTML)
+            guard !text.isEmpty else { return nil }
+            let urlText = decodeHTMLEntities(String(watch[urlRange]))
+            let context = firstCapture(
+                #"<span\s+class="[^"]*\bwatch-tweet-context\b[^"]*"[^>]*>([\s\S]*?)</span>"#,
+                in: body
             )
-            let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            .map(plainText(from:))
+            .flatMap(cleanReplyContext(_:))
+            return TiboTweet(
+                id: urlText,
+                date: firstAttribute("data-datetime", in: body).flatMap(parseISODate),
+                text: text,
+                inReplyTo: context,
+                url: URL(string: urlText)
+            )
         }
+    }
 
-        return TiboTweet(
-            id: urlText,
-            date: parseISODate(dateText),
-            text: text,
-            inReplyTo: replyText,
-            url: URL(string: decodeHTMLEntities(urlText))
+    private static func cleanReplyContext(_ value: String) -> String? {
+        let cleaned = value.replacingOccurrences(
+            of: #"^\s*(?:in\s+reply\s+to|replying\s+to)\s*"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
         )
+        .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n\r\"“”"))
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     private static func parseISODate(_ value: String) -> Date? {
@@ -2950,7 +4440,8 @@ enum ForecastService {
         }
         let entities = [
             "&gt;": ">", "&lt;": "<", "&amp;": "&", "&quot;": "\"",
-            "&#39;": "'", "&middot;": "·", "&nbsp;": " "
+            "&#39;": "'", "&middot;": "·", "&nbsp;": " ",
+            "&ldquo;": "“", "&rdquo;": "”", "&lsquo;": "‘", "&rsquo;": "’"
         ]
         for (entity, replacement) in entities {
             text = text.replacingOccurrences(of: entity, with: replacement)
@@ -2970,7 +4461,8 @@ enum ForecastService {
         var text = value
         let entities = [
             "&gt;": ">", "&lt;": "<", "&amp;": "&", "&quot;": "\"",
-            "&#39;": "'", "&middot;": "·", "&nbsp;": " "
+            "&#39;": "'", "&middot;": "·", "&nbsp;": " ",
+            "&ldquo;": "“", "&rdquo;": "”", "&lsquo;": "‘", "&rsquo;": "’"
         ]
         for (entity, replacement) in entities {
             text = text.replacingOccurrences(of: entity, with: replacement)
@@ -2984,7 +4476,6 @@ struct DashboardView: View {
     @ObservedObject var model: DashboardModel
     @AppStorage(WidgetTheme.defaultsKey) private var themeRawValue = WidgetTheme.current.rawValue
     @AppStorage(UsagePaceRate.defaultsKey) private var paceRateRawValue = UsagePaceRate.oneHour.rawValue
-    @AppStorage(ForecastSource.defaultsKey) private var resetCalculatorRawValue = ForecastSource.lunarWerx.rawValue
     @AppStorage(DockPosition.defaultsKey) private var dockPositionRawValue = DockPosition.floating.rawValue
     @State private var showingTweets = false
     @State private var showingNewTweetAlert = false
@@ -3045,13 +4536,6 @@ struct DashboardView: View {
                 toggleOrientation()
             }
         }
-        .overlay(alignment: .bottomTrailing) {
-            if !dockPosition.isMounted {
-                ResizeHandleView(lineColor: theme.isLight ? NSColor.black : NSColor.white)
-                    .frame(width: 32, height: 32)
-                    .padding(2)
-            }
-        }
         .clipShape(DockClipShape(position: dockPosition))
         .contentShape(DockClipShape(position: dockPosition))
         .preferredColorScheme(theme.isLight ? .light : .dark)
@@ -3067,15 +4551,13 @@ struct DashboardView: View {
                 paceRateRawValue = rawValue
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceResetCalculatorChanged)) { notification in
-            if let rawValue = notification.object as? String {
-                resetCalculatorRawValue = rawValue
-            }
-        }
         .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceDockChanged)) { notification in
             if let rawValue = notification.object as? String {
                 dockPositionRawValue = rawValue
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceShowTweets)) { _ in
+            showingTweets = true
         }
         // The alert belongs to the persistent window, not to a particular
         // dial layout. Keeping it here prevents dock/undock and orientation
@@ -3124,12 +4606,12 @@ struct DashboardView: View {
             }
         )
         .popover(isPresented: $showingSubscription, arrowEdge: .bottom) {
-            SubscriptionInfoPopover(planName: model.planName)
+            SubscriptionInfoPopover(planName: model.planName, theme: theme)
         }
         ThemedInstrumentDial(
             theme: theme,
             progress: model.usedPercent,
-            color: Color(hex: 0x7EE6AE),
+            color: Color(hex: 0x2F80ED),
             symbol: .codex,
             detail: nil,
             themeFooter: "⏱ \(usagePace.estimatedRunout.uppercased())",
@@ -3149,17 +4631,27 @@ struct DashboardView: View {
                 weeklyTokens: model.weeklyTokens,
                 localTokensTotal: model.localTokensTotal,
                 localTokenPace: model.localTokenPace,
+                usageIntelligence: model.usageIntelligence,
+                secondaryQuota: model.secondaryQuota,
+                quotaInventory: model.quotaInventory,
+                creditSummary: model.creditSummary,
+                resetCredits: model.resetCredits,
+                activeTasks: model.activeTasks,
+                weeklyArchives: model.weeklyArchives,
                 usedPercent: model.usedPercent,
                 windowStartDate: model.usageWindowStart,
                 resetAt: model.resetAt,
-                paceRate: paceRate
+                paceRate: paceRate,
+                theme: theme,
+                onRebuildIntelligence: model.rebuildUsageIntelligence,
+                onPurgeUsageData: model.purgeUsageData
             )
         }
         ZStack(alignment: .topTrailing) {
             ThemedInstrumentDial(
                 theme: theme,
                 progress: model.forecastPercent ?? 0,
-                color: Color(hex: 0x58B9F3),
+                color: Color(hex: 0x68D9A0),
                 symbol: .system("arrow.triangle.2.circlepath"),
                 detail: resetScheduleFooter ?? (model.resetAnnouncement == nil ? model.resetIntel?.compactLabel : "🔥 USE IT NOW"),
                 themeFooter: resetScheduleFooter ?? (model.resetAnnouncement == nil ? model.resetIntel?.compactLabel : "🔥 USE IT NOW"),
@@ -3178,18 +4670,18 @@ struct DashboardView: View {
                 } label: {
                     Image(systemName: "text.bubble.fill")
                         .font(.system(size: max(8, 11 * interfaceScale), weight: .semibold))
-                        .foregroundStyle(Color(hex: 0x58B9F3))
+                        .foregroundStyle(Color(hex: 0x68D9A0))
                         .frame(width: max(16, 25 * interfaceScale), height: max(16, 25 * interfaceScale))
                         .background(
                             Circle()
                                 .fill(Color(hex: 0x0D1115).opacity(0.9))
-                                .overlay(Circle().stroke(Color(hex: 0x58B9F3).opacity(0.42), lineWidth: 1))
+                                .overlay(Circle().stroke(Color(hex: 0x68D9A0).opacity(0.42), lineWidth: 1))
                         )
                 }
                 .buttonStyle(.plain)
                 .padding(max(4, 8 * interfaceScale))
                 .help("Tibo reset posts")
-                // Open above the blue dial in the compact vertical layout so
+                // Open above the reset dial in the compact vertical layout so
                 // the feed gets room to show full post text instead of being
                 // squeezed against the bottom of the screen.
                 .popover(isPresented: $showingTweets, arrowEdge: .top) {
@@ -3205,7 +4697,11 @@ struct DashboardView: View {
         .popover(isPresented: $showingResetDetails, arrowEdge: .bottom) {
             ResetCalculatorPopover(
                 snapshot: model.forecastSnapshot,
-                status: model.forecastStatus
+                effectiveScore: model.forecastPercent,
+                announcementActive: model.resetAnnouncement != nil,
+                status: model.forecastStatus,
+                lifecycle: model.resetLifecycle,
+                theme: theme
             )
         }
     }
@@ -3216,6 +4712,10 @@ struct DashboardView: View {
                 calendarProgress: model.weekElapsedPercent ?? 0,
                 usageProgress: model.usedPercent ?? 0,
                 resetProgress: model.forecastPercent ?? 0,
+                calendarDetail: compactResetDate,
+                usageDetail: compactPaceLabel,
+                resetDetail: model.resetIntel?.compactLabel ?? "🙏🏻 —",
+                resetCountdownAt: prominentResetCountdownAt,
                 resetAnnounced: model.resetAnnouncement != nil,
                 theme: theme,
                 position: .floating
@@ -3227,12 +4727,12 @@ struct DashboardView: View {
                 } label: {
                     Image(systemName: "text.bubble.fill")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Color(hex: 0x58B9F3))
+                        .foregroundStyle(Color(hex: 0x68D9A0))
                         .frame(width: 28, height: 28)
                         .background(
                             Circle()
                                 .fill(theme.isLight ? Color.white.opacity(0.92) : Color(hex: 0x0D1115).opacity(0.94))
-                                .overlay(Circle().stroke(Color(hex: 0x58B9F3).opacity(0.48), lineWidth: 1))
+                                .overlay(Circle().stroke(Color(hex: 0x68D9A0).opacity(0.48), lineWidth: 1))
                         )
                 }
                 .buttonStyle(.plain)
@@ -3242,14 +4742,6 @@ struct DashboardView: View {
                 }
             }
 
-            if let expectedAt = activeScheduledResetAt {
-                VStack {
-                    Spacer()
-                    ResetCountdownBadge(expectedAt: expectedAt, compact: true, minimal: true)
-                        .padding(.bottom, 3)
-                }
-                .allowsHitTesting(false)
-            }
         }
         .background(
             CompactRingActionView(
@@ -3259,7 +4751,7 @@ struct DashboardView: View {
             )
         )
         .popover(isPresented: $showingSubscription, arrowEdge: .bottom) {
-            SubscriptionInfoPopover(planName: model.planName)
+            SubscriptionInfoPopover(planName: model.planName, theme: theme)
         }
         .popover(isPresented: $showingUsageChart, arrowEdge: .bottom) {
             UsageChartPopover(
@@ -3268,33 +4760,63 @@ struct DashboardView: View {
                 weeklyTokens: model.weeklyTokens,
                 localTokensTotal: model.localTokensTotal,
                 localTokenPace: model.localTokenPace,
+                usageIntelligence: model.usageIntelligence,
+                secondaryQuota: model.secondaryQuota,
+                quotaInventory: model.quotaInventory,
+                creditSummary: model.creditSummary,
+                resetCredits: model.resetCredits,
+                activeTasks: model.activeTasks,
+                weeklyArchives: model.weeklyArchives,
                 usedPercent: model.usedPercent,
                 windowStartDate: model.usageWindowStart,
                 resetAt: model.resetAt,
-                paceRate: paceRate
+                paceRate: paceRate,
+                theme: theme,
+                onRebuildIntelligence: model.rebuildUsageIntelligence,
+                onPurgeUsageData: model.purgeUsageData
             )
         }
         .popover(isPresented: $showingResetDetails, arrowEdge: .bottom) {
             ResetCalculatorPopover(
                 snapshot: model.forecastSnapshot,
-                status: model.forecastStatus
+                effectiveScore: model.forecastPercent,
+                announcementActive: model.resetAnnouncement != nil,
+                status: model.forecastStatus,
+                lifecycle: model.resetLifecycle,
+                theme: theme
             )
         }
-        .help("Orange: calendar · Green: Codex usage · Blue: reset estimate")
+        .help("Orange: calendar · Indigo: Codex usage · Green: reset estimate")
     }
 
     private func mountedRingView(position: DockPosition) -> some View {
         GeometryReader { geometry in
             let metrics = DockMetrics(position: position, size: geometry.size)
             ZStack {
-                MountedQuotaRings(
-                    calendarProgress: model.weekElapsedPercent ?? 0,
-                    usageProgress: model.usedPercent ?? 0,
-                    resetProgress: model.forecastPercent ?? 0,
-                    resetAnnounced: model.resetAnnouncement != nil,
-                    theme: theme,
-                    position: position
-                )
+                if position.isEdge {
+                    MountedQuotaRail(
+                        calendarProgress: model.weekElapsedPercent ?? 0,
+                        usageProgress: model.usedPercent ?? 0,
+                        resetProgress: model.forecastPercent ?? 0,
+                        resetCountdownAt: prominentResetCountdownAt,
+                        resetAnnounced: model.resetAnnouncement != nil,
+                        theme: theme,
+                        position: position
+                    )
+                } else {
+                    MountedQuotaRings(
+                        calendarProgress: model.weekElapsedPercent ?? 0,
+                        usageProgress: model.usedPercent ?? 0,
+                        resetProgress: model.forecastPercent ?? 0,
+                        calendarDetail: compactResetDate,
+                        usageDetail: compactPaceLabel,
+                        resetDetail: model.resetIntel?.compactLabel ?? "🙏🏻 —",
+                        resetCountdownAt: prominentResetCountdownAt,
+                        resetAnnounced: model.resetAnnouncement != nil,
+                        theme: theme,
+                        position: position
+                    )
+                }
 
                 if !(model.resetIntel?.tweets.isEmpty ?? true) {
                     Button {
@@ -3302,12 +4824,12 @@ struct DashboardView: View {
                     } label: {
                         Image(systemName: "text.bubble.fill")
                             .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(Color(hex: 0x58B9F3))
+                            .foregroundStyle(Color(hex: 0x68D9A0))
                             .frame(width: 27, height: 27)
                             .background(
                                 Circle()
                                     .fill(theme.isLight ? Color.white.opacity(0.94) : Color(hex: 0x0D1115).opacity(0.95))
-                                    .overlay(Circle().stroke(Color(hex: 0x58B9F3).opacity(0.52), lineWidth: 1))
+                                    .overlay(Circle().stroke(Color(hex: 0x68D9A0).opacity(0.52), lineWidth: 1))
                             )
                     }
                     .buttonStyle(.plain)
@@ -3318,11 +4840,6 @@ struct DashboardView: View {
                     }
                 }
 
-                if let expectedAt = activeScheduledResetAt {
-                    ResetCountdownBadge(expectedAt: expectedAt, compact: true, minimal: true)
-                        .position(metrics.countdownPoint)
-                        .allowsHitTesting(false)
-                }
             }
             .background(
                 MountedRingActionView(
@@ -3334,7 +4851,7 @@ struct DashboardView: View {
             )
         }
         .popover(isPresented: $showingSubscription, arrowEdge: .bottom) {
-            SubscriptionInfoPopover(planName: model.planName)
+            SubscriptionInfoPopover(planName: model.planName, theme: theme)
         }
         .popover(isPresented: $showingUsageChart, arrowEdge: .bottom) {
             UsageChartPopover(
@@ -3343,16 +4860,33 @@ struct DashboardView: View {
                 weeklyTokens: model.weeklyTokens,
                 localTokensTotal: model.localTokensTotal,
                 localTokenPace: model.localTokenPace,
+                usageIntelligence: model.usageIntelligence,
+                secondaryQuota: model.secondaryQuota,
+                quotaInventory: model.quotaInventory,
+                creditSummary: model.creditSummary,
+                resetCredits: model.resetCredits,
+                activeTasks: model.activeTasks,
+                weeklyArchives: model.weeklyArchives,
                 usedPercent: model.usedPercent,
                 windowStartDate: model.usageWindowStart,
                 resetAt: model.resetAt,
-                paceRate: paceRate
+                paceRate: paceRate,
+                theme: theme,
+                onRebuildIntelligence: model.rebuildUsageIntelligence,
+                onPurgeUsageData: model.purgeUsageData
             )
         }
         .popover(isPresented: $showingResetDetails, arrowEdge: .bottom) {
-            ResetCalculatorPopover(snapshot: model.forecastSnapshot, status: model.forecastStatus)
+            ResetCalculatorPopover(
+                snapshot: model.forecastSnapshot,
+                effectiveScore: model.forecastPercent,
+                announcementActive: model.resetAnnouncement != nil,
+                status: model.forecastStatus,
+                lifecycle: model.resetLifecycle,
+                theme: theme
+            )
         }
-        .help("Drag away to unmount · Orange: calendar · Green: usage · Blue: reset")
+        .help("Drag away to unmount · Orange: calendar · Blue: usage · Green: reset")
     }
 
     private func toggleOrientation() {
@@ -3417,8 +4951,28 @@ struct DashboardView: View {
             usageHistory: model.usageHistory,
             localTokensTotal: model.localTokensTotal,
             localTokenPace: model.localTokenPace,
+            usageIntelligence: model.usageIntelligence,
             rate: paceRate
         )
+    }
+
+    private var compactResetDate: String {
+        guard let date = model.resetAt else { return "↻ —" }
+        let formatter = DateFormatter()
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "E h:mma"
+        return "↻ " + formatter.string(from: date).uppercased()
+    }
+
+    private var compactPaceLabel: String {
+        let value = usagePace.estimatedRunout.uppercased()
+        let shortened: String
+        switch value {
+        case "COLLECTING", "CALIBRATING": shortened = "LEARNING"
+        case "STEADY", "IDLE", "UNUSED", "NOW", "—": shortened = value
+        default: shortened = value.split(separator: " ").prefix(2).joined(separator: " ")
+        }
+        return "⏱ " + shortened
     }
 
     private var resetAccessibilityLabel: String {
@@ -3428,16 +4982,17 @@ struct DashboardView: View {
         return "Week elapsed, resets \(resetDay) at \(resetClock)"
     }
 
-    private var activeScheduledResetAt: Date? {
-        guard let expectedAt = model.forecastSnapshot?.scheduledReset?.expectedAt,
-              expectedAt > Date().addingTimeInterval(-5 * 60)
-        else { return nil }
-        return expectedAt
+    private var resetScheduleFooter: String? {
+        guard let expectedAt = prominentResetCountdownAt else { return nil }
+        if model.resetLifecycle.isDelayed(), expectedAt == model.resetLifecycle.activeExpectedAt() {
+            return "⚠ DELAYED · \(Self.localTime(expectedAt))"
+        }
+        return "⏳ \(Self.countdown(to: expectedAt)) · \(Self.localTime(expectedAt))"
     }
 
-    private var resetScheduleFooter: String? {
-        guard let expectedAt = activeScheduledResetAt else { return nil }
-        return "⏳ \(Self.countdown(to: expectedAt)) · \(Self.localTime(expectedAt))"
+    private var prominentResetCountdownAt: Date? {
+        guard model.resetAnnouncement != nil else { return nil }
+        return model.resetLifecycle.activeExpectedAt()
     }
 
     private static func countdown(to date: Date, now: Date = Date()) -> String {
@@ -3458,51 +5013,16 @@ struct DashboardView: View {
     }
 }
 
-private struct ResetCountdownBadge: View {
-    let expectedAt: Date
-    let compact: Bool
-    let minimal: Bool
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
-            HStack(spacing: compact ? 4 : 6) {
-                Image(systemName: "hourglass")
-                Text(countdown(at: context.date, includesLabel: !minimal))
-                if !minimal {
-                    Text("·").foregroundStyle(Color.white.opacity(0.28))
-                    Text(localTime)
-                }
-            }
-            .font(.system(size: compact ? 7 : 9, weight: .bold, design: .monospaced))
-            .monospacedDigit()
-            .foregroundStyle(Color(hex: 0x8BD2FF))
-            .padding(.horizontal, compact ? 6 : 8)
-            .frame(height: compact ? 18 : 22)
-            .background(
-                Capsule()
-                    .fill(Color(hex: 0x07121A).opacity(0.92))
-                    .overlay(Capsule().stroke(Color(hex: 0x58B9F3).opacity(0.42), lineWidth: 0.8))
-            )
-        }
-    }
-
-    private func countdown(at now: Date, includesLabel: Bool) -> String {
+private enum ResetCountdownLabel {
+    static func short(to expectedAt: Date, now: Date = Date()) -> String {
+        guard expectedAt > now else { return "DELAYED" }
         let totalMinutes = max(0, Int(ceil(expectedAt.timeIntervalSince(now) / 60)))
         let days = totalMinutes / 1_440
         let hours = (totalMinutes % 1_440) / 60
         let minutes = totalMinutes % 60
-        let value: String
-        if days > 0 { value = "\(days)D \(hours)H" }
-        else if hours > 0 { value = "\(hours)H \(minutes)M" }
-        else { value = "\(minutes)M" }
-        return includesLabel ? "RESET \(value)" : value
-    }
-
-    private var localTime: String {
-        let formatter = DateFormatter()
-        formatter.timeZone = .autoupdatingCurrent
-        formatter.dateFormat = "h:mm a z"
-        return formatter.string(from: expectedAt).uppercased()
+        if days > 0 { return "\(days)D \(hours)H" }
+        if hours > 0 { return "\(hours)H \(minutes)M" }
+        return "\(minutes)M"
     }
 }
 
@@ -3786,6 +5306,7 @@ private final class WebKitBillingService: NSObject, WKNavigationDelegate {
 
 private struct SubscriptionInfoPopover: View {
     let planName: String
+    let theme: WidgetTheme
     @AppStorage(BillingDefaults.renewalTimestamp) private var renewalTimestamp = 0.0
     @AppStorage(BillingDefaults.webPlanName) private var webPlanName = ""
     @AppStorage(BillingDefaults.dateLabel) private var dateLabel = "NEXT RENEWAL"
@@ -3794,6 +5315,8 @@ private struct SubscriptionInfoPopover: View {
     @State private var syncMessage: String?
     @State private var showingDateEditor = false
     @State private var isConnected = BillingKeychain.hasConnectedSession
+
+    private var palette: PopoverPalette { theme.popoverPalette }
 
     private var renewalDate: Date? {
         guard renewalTimestamp > 0 else { return nil }
@@ -3807,7 +5330,7 @@ private struct SubscriptionInfoPopover: View {
                     Text("BILLING CYCLE")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .tracking(1.2)
-                        .foregroundStyle(Color.white.opacity(0.38))
+                        .foregroundStyle(palette.tertiary)
                     Text((webPlanName.isEmpty ? planName : webPlanName).uppercased())
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                 }
@@ -3817,7 +5340,7 @@ private struct SubscriptionInfoPopover: View {
                     .frame(width: 7, height: 7)
                 Text(isConnected ? verificationLabel : "LOCAL ONLY")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.46))
+                    .foregroundStyle(palette.tertiary)
             }
             .padding(.bottom, 18)
 
@@ -3826,35 +5349,33 @@ private struct SubscriptionInfoPopover: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(dateLabel.replacingOccurrences(of: "PLAN ", with: ""))
                             .font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .foregroundStyle(Color(hex: 0xF2AD3E).opacity(0.8))
+                            .foregroundStyle(palette.billing.opacity(0.86))
                         Text(renewalDate.formatted(.dateTime.month(.abbreviated).day()))
-                            .font(.system(size: 38, weight: .light, design: .rounded))
+                            .font(.system(size: 38, weight: .light, design: palette.numberDesign))
                             .tracking(-1.4)
                         Text(renewalDate.formatted(.dateTime.year()))
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(Color.white.opacity(0.38))
+                            .foregroundStyle(palette.tertiary)
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 5) {
                         Text(countdownNumber(to: renewalDate))
-                            .font(.system(size: 34, weight: .light, design: .rounded))
+                            .font(.system(size: 34, weight: .light, design: palette.numberDesign))
                             .monospacedDigit()
                         Text(countdownUnit(to: renewalDate))
                             .font(.system(size: 9, weight: .bold, design: .monospaced))
                             .tracking(1)
-                            .foregroundStyle(Color.white.opacity(0.4))
+                            .foregroundStyle(palette.tertiary)
                     }
                 }
 
-                Rectangle()
-                    .fill(Color(hex: 0xF2AD3E))
-                    .frame(height: 2)
+                cycleTrack(to: renewalDate)
                     .padding(.vertical, 14)
 
                 HStack(spacing: 9) {
                     Image(systemName: dateLabel.contains("CHANGES TO PLUS") ? "arrow.down.right" : "bell")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Color(hex: 0xF2AD3E))
+                        .foregroundStyle(palette.billing)
                     Text(dateLabel.contains("CHANGES TO PLUS") ? "$20 PLAN SCHEDULED" : "DOWNGRADE BEFORE RENEWAL")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                     Spacer()
@@ -3863,7 +5384,7 @@ private struct SubscriptionInfoPopover: View {
                     } label: {
                         Image(systemName: "pencil")
                             .frame(width: 24, height: 24)
-                            .background(Circle().fill(Color.white.opacity(0.07)))
+                            .background(Circle().fill(palette.surface))
                     }
                     .buttonStyle(.plain)
                 }
@@ -3877,12 +5398,12 @@ private struct SubscriptionInfoPopover: View {
             } else {
                 Text("Connect once. Quota Glance will read the plan and next billing change silently afterward.")
                     .font(.system(size: 13, weight: .medium, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.64))
+                    .foregroundStyle(palette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.vertical, 18)
             }
 
-            Divider().overlay(Color.white.opacity(0.08)).padding(.vertical, 14)
+            Divider().overlay(palette.rule).padding(.vertical, 14)
 
             HStack(spacing: 10) {
                 actionButton(isSyncing ? "SYNCING" : "REFRESH", icon: "arrow.clockwise") {
@@ -3898,21 +5419,22 @@ private struct SubscriptionInfoPopover: View {
             if let syncMessage {
                 Text(syncMessage)
                     .font(.system(size: 9, weight: .medium, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.44))
+                    .foregroundStyle(palette.tertiary)
                     .padding(.top, 10)
             }
         }
         .padding(18)
         .frame(width: 334)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(hex: 0x101419))
+            RoundedRectangle(cornerRadius: palette.cornerRadius, style: .continuous)
+                .fill(palette.background)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color(hex: 0xF2AD3E).opacity(0.28), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: palette.cornerRadius, style: .continuous)
+                        .stroke(palette.billing.opacity(0.3), lineWidth: 1)
                 )
         )
-        .preferredColorScheme(.dark)
+        .foregroundStyle(palette.primary)
+        .preferredColorScheme(theme.isLight ? .light : .dark)
         .onAppear {
             rollRenewalForwardIfNeeded()
             isConnected = BillingKeychain.hasConnectedSession
@@ -3920,6 +5442,31 @@ private struct SubscriptionInfoPopover: View {
         .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceBillingUpdated)) { _ in
             isConnected = true
         }
+    }
+
+    private func cycleTrack(to date: Date) -> some View {
+        let days = max(0, Calendar.current.dateComponents(
+            [.day],
+            from: Calendar.current.startOfDay(for: Date()),
+            to: Calendar.current.startOfDay(for: date)
+        ).day ?? 0)
+        let progress = CGFloat(max(0, min(1, 1 - Double(days) / 30)))
+        return GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Rectangle().fill(palette.rule).frame(height: 1)
+                Rectangle().fill(palette.billing)
+                    .frame(width: geometry.size.width * progress, height: 2)
+                Circle()
+                    .fill(palette.background)
+                    .overlay(Circle().stroke(palette.billing, lineWidth: 1.4))
+                    .frame(width: 7, height: 7)
+                    .offset(x: max(0, geometry.size.width * progress - 3.5))
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
+        }
+        .frame(height: 8)
+        .accessibilityLabel("Billing cycle progress")
+        .accessibilityValue("\(days) days left")
     }
 
     private var renewalBinding: Binding<Date> {
@@ -3965,15 +5512,15 @@ private struct SubscriptionInfoPopover: View {
                 Spacer(minLength: 0)
             }
             .font(.system(size: 9, weight: .bold, design: .monospaced))
-            .foregroundStyle(Color.white.opacity(0.72))
+            .foregroundStyle(palette.secondary)
             .padding(.horizontal, 11)
             .frame(maxWidth: .infinity, minHeight: 34)
             .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Color.white.opacity(0.055))
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(palette.surface)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(palette.rule, lineWidth: 1)
                     )
             )
         }
@@ -4045,6 +5592,16 @@ private struct DockMetrics {
         }
     }
 
+    var readoutScale: CGFloat {
+        guard position.isMounted else { return 1 }
+        let base = position.mountedSize
+        let geometricScale = min(size.width / max(1, base.width), size.height / max(1, base.height))
+        // The original type sizes are the legibility floor. Enlarging a
+        // mounted dial scales its readouts with the rings; shrinking never
+        // turns them back into unreadable microtype.
+        return min(2, max(1, geometricScale))
+    }
+
     var diameter: CGFloat {
         switch position {
         case .topLeft, .topRight, .bottomLeft, .bottomRight:
@@ -4065,27 +5622,11 @@ private struct DockMetrics {
         case .topRight: return CGPoint(x: size.width - inset, y: inset)
         case .bottomLeft: return CGPoint(x: inset, y: size.height - inset)
         case .bottomRight: return CGPoint(x: size.width - inset, y: size.height - inset)
-        case .left: return CGPoint(x: inset, y: size.height / 2)
-        case .right: return CGPoint(x: size.width - inset, y: size.height / 2)
-        case .top: return CGPoint(x: size.width / 2, y: inset)
-        case .bottom: return CGPoint(x: size.width / 2, y: size.height - inset)
+        case .left: return CGPoint(x: size.width - 17, y: size.height / 2)
+        case .right: return CGPoint(x: 17, y: size.height / 2)
+        case .top: return CGPoint(x: size.width / 2, y: size.height - 17)
+        case .bottom: return CGPoint(x: size.width / 2, y: 17)
         case .floating: return center
-        }
-    }
-
-    var countdownPoint: CGPoint {
-        let inward: CGFloat = 48
-        let cross: CGFloat = 38
-        switch position {
-        case .topLeft, .topRight:
-            return CGPoint(x: size.width / 2, y: size.height * 0.76)
-        case .bottomLeft, .bottomRight:
-            return CGPoint(x: size.width / 2, y: size.height * 0.24)
-        case .left: return CGPoint(x: inward + 20, y: size.height / 2 + cross)
-        case .right: return CGPoint(x: size.width - inward - 20, y: size.height / 2 + cross)
-        case .top: return CGPoint(x: size.width / 2 + cross, y: inward + 14)
-        case .bottom: return CGPoint(x: size.width / 2 + cross, y: size.height - inward - 14)
-        case .floating: return CGPoint(x: size.width / 2, y: size.height - 16)
         }
     }
 
@@ -4121,6 +5662,9 @@ private struct DockClipShape: Shape {
         guard position.isMounted else {
             return Path(roundedRect: rect, cornerRadius: 31, style: .continuous)
         }
+        if position.isEdge {
+            return EdgeRailShape(position: position).path(in: rect)
+        }
         let metrics = DockMetrics(position: position, size: rect.size)
         let circleRect = CGRect(
             x: metrics.center.x - metrics.diameter / 2,
@@ -4129,6 +5673,224 @@ private struct DockClipShape: Shape {
             height: metrics.diameter
         )
         return Path(ellipseIn: circleRect)
+    }
+}
+
+private struct EdgeRailShape: Shape {
+    let position: DockPosition
+
+    func path(in rect: CGRect) -> Path {
+        let vertical = position == .left || position == .right
+        let depth = vertical ? rect.width : rect.height
+        let bodyInset = depth * 0.18
+        let cornerRadius = min(25, depth * 0.28)
+        let tabHalf = depth * 0.23
+        var path = Path()
+        switch position {
+        case .left:
+            let edge = rect.maxX - bodyInset
+            path.move(to: CGPoint(x: cornerRadius, y: rect.minY))
+            path.addLine(to: CGPoint(x: edge - cornerRadius, y: rect.minY))
+            path.addQuadCurve(to: CGPoint(x: edge, y: rect.minY + cornerRadius), control: CGPoint(x: edge, y: rect.minY))
+            path.addLine(to: CGPoint(x: edge, y: rect.midY - tabHalf))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.midY), control: CGPoint(x: rect.maxX - 2, y: rect.midY - tabHalf * 0.65))
+            path.addQuadCurve(to: CGPoint(x: edge, y: rect.midY + tabHalf), control: CGPoint(x: rect.maxX - 2, y: rect.midY + tabHalf * 0.65))
+            path.addLine(to: CGPoint(x: edge, y: rect.maxY - cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: edge - cornerRadius, y: rect.maxY), control: CGPoint(x: edge, y: rect.maxY))
+            path.addLine(to: CGPoint(x: cornerRadius, y: rect.maxY))
+            path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - cornerRadius), control: CGPoint(x: rect.minX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: cornerRadius, y: rect.minY), control: CGPoint(x: rect.minX, y: rect.minY))
+        case .right:
+            let edge = rect.minX + bodyInset
+            path.move(to: CGPoint(x: edge + cornerRadius, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX - cornerRadius, y: rect.minY))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY + cornerRadius), control: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX - cornerRadius, y: rect.maxY), control: CGPoint(x: rect.maxX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: edge + cornerRadius, y: rect.maxY))
+            path.addQuadCurve(to: CGPoint(x: edge, y: rect.maxY - cornerRadius), control: CGPoint(x: edge, y: rect.maxY))
+            path.addLine(to: CGPoint(x: edge, y: rect.midY + tabHalf))
+            path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.midY), control: CGPoint(x: rect.minX + 2, y: rect.midY + tabHalf * 0.65))
+            path.addQuadCurve(to: CGPoint(x: edge, y: rect.midY - tabHalf), control: CGPoint(x: rect.minX + 2, y: rect.midY - tabHalf * 0.65))
+            path.addLine(to: CGPoint(x: edge, y: rect.minY + cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: edge + cornerRadius, y: rect.minY), control: CGPoint(x: edge, y: rect.minY))
+        case .top:
+            let edge = rect.maxY - bodyInset
+            path.move(to: CGPoint(x: rect.minX + cornerRadius, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX - cornerRadius, y: rect.minY))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY + cornerRadius), control: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: edge - cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX - cornerRadius, y: edge), control: CGPoint(x: rect.maxX, y: edge))
+            path.addLine(to: CGPoint(x: rect.midX + tabHalf, y: edge))
+            path.addQuadCurve(to: CGPoint(x: rect.midX, y: rect.maxY), control: CGPoint(x: rect.midX + tabHalf * 0.65, y: rect.maxY - 2))
+            path.addQuadCurve(to: CGPoint(x: rect.midX - tabHalf, y: edge), control: CGPoint(x: rect.midX - tabHalf * 0.65, y: rect.maxY - 2))
+            path.addLine(to: CGPoint(x: rect.minX + cornerRadius, y: edge))
+            path.addQuadCurve(to: CGPoint(x: rect.minX, y: edge - cornerRadius), control: CGPoint(x: rect.minX, y: edge))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.minX + cornerRadius, y: rect.minY), control: CGPoint(x: rect.minX, y: rect.minY))
+        case .bottom:
+            let edge = rect.minY + bodyInset
+            path.move(to: CGPoint(x: rect.minX + cornerRadius, y: edge))
+            path.addLine(to: CGPoint(x: rect.midX - tabHalf, y: edge))
+            path.addQuadCurve(to: CGPoint(x: rect.midX, y: rect.minY), control: CGPoint(x: rect.midX - tabHalf * 0.65, y: rect.minY + 2))
+            path.addQuadCurve(to: CGPoint(x: rect.midX + tabHalf, y: edge), control: CGPoint(x: rect.midX + tabHalf * 0.65, y: rect.minY + 2))
+            path.addLine(to: CGPoint(x: rect.maxX - cornerRadius, y: edge))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: edge + cornerRadius), control: CGPoint(x: rect.maxX, y: edge))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX - cornerRadius, y: rect.maxY), control: CGPoint(x: rect.maxX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX + cornerRadius, y: rect.maxY))
+            path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - cornerRadius), control: CGPoint(x: rect.minX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX, y: edge + cornerRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.minX + cornerRadius, y: edge), control: CGPoint(x: rect.minX, y: edge))
+        default:
+            return Path(roundedRect: rect, cornerRadius: cornerRadius, style: .continuous)
+        }
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct MountedQuotaRail: View {
+    let calendarProgress: Double
+    let usageProgress: Double
+    let resetProgress: Double
+    let resetCountdownAt: Date?
+    let resetAnnounced: Bool
+    let theme: WidgetTheme
+    let position: DockPosition
+
+    var body: some View {
+        GeometryReader { geometry in
+            let vertical = position == .left || position == .right
+            let scale = min(1.7, max(1, min(geometry.size.width / 112, geometry.size.height / 330)))
+            let railLayout = vertical
+                ? AnyLayout(VStackLayout(spacing: 12 * scale))
+                : AnyLayout(HStackLayout(spacing: 12 * scale))
+            let horizontalInset: Edge.Set = position == .left ? .trailing : position == .right ? .leading : .horizontal
+            let verticalInset: Edge.Set = position == .top ? .bottom : position == .bottom ? .top : .vertical
+
+            railLayout {
+                railMetric(progress: calendarProgress, color: palette.orange, symbol: "calendar.badge.clock", roundsDown: true, scale: scale)
+                railMetric(progress: usageProgress, color: palette.usage, symbol: "chevron.left.forwardslash.chevron.right", roundsDown: false, scale: scale)
+                railMetric(
+                    progress: resetProgress,
+                    color: palette.reset,
+                    symbol: "clock.arrow.circlepath",
+                    roundsDown: false,
+                    countdownAt: resetCountdownAt,
+                    alerting: resetAnnounced,
+                    scale: scale
+                )
+            }
+            .padding(.horizontal, 8 * scale)
+            .padding(.vertical, 12 * scale)
+            .padding(horizontalInset, 10 * scale)
+            .padding(verticalInset, 10 * scale)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                EdgeRailShape(position: position)
+                    .fill(faceColor)
+                    .overlay(EdgeRailShape(position: position).stroke(faceBorderColor, lineWidth: theme == .marine ? 1 : 0.6))
+            )
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Mounted quota rail")
+        .accessibilityValue("Calendar \(Int(calendarProgress.rounded(.down))) percent, Codex usage \(Int(usageProgress.rounded())) percent, reset estimate \(Int(resetProgress.rounded())) percent")
+        .animation(.easeOut(duration: 0.35), value: calendarProgress)
+        .animation(.easeOut(duration: 0.35), value: usageProgress)
+        .animation(.easeOut(duration: 0.35), value: resetProgress)
+    }
+
+    private func railMetric(
+        progress: Double,
+        color: Color,
+        symbol: String,
+        roundsDown: Bool,
+        countdownAt: Date? = nil,
+        alerting: Bool = false,
+        scale: CGFloat
+    ) -> some View {
+        let value = roundsDown ? progress.rounded(.down) : progress.rounded()
+        let fraction = max(0, min(1, progress / 100))
+        let ringSize = 50 * scale
+        let lineWidth = 2.6 * scale
+        return VStack(spacing: 3 * scale) {
+            ZStack {
+                Circle()
+                    .stroke(color.opacity(trackOpacity), lineWidth: lineWidth)
+                if alerting {
+                    TimelineView(.periodic(from: .now, by: 0.8)) { context in
+                        Circle()
+                            .trim(from: 0, to: fraction)
+                            .stroke(ResetAlertBar.gradient(at: ResetAlertBar.phase(at: context.date)), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                    }
+                } else {
+                    Circle()
+                        .trim(from: 0, to: fraction)
+                        .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                if let countdownAt {
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        VStack(spacing: 1 * scale) {
+                            Image(systemName: "hourglass")
+                                .font(.system(size: 8 * scale, weight: .bold))
+                            Text(ResetCountdownLabel.short(to: countdownAt, now: context.date))
+                                .font(.system(size: 7 * scale, weight: .bold, design: .monospaced))
+                                .monospacedDigit()
+                                .minimumScaleFactor(0.72)
+                        }
+                        .foregroundStyle(color)
+                        .lineLimit(1)
+                        .frame(width: ringSize * 0.72)
+                    }
+                } else {
+                    Image(systemName: symbol)
+                        .font(.system(size: 10.5 * scale, weight: .medium))
+                        .symbolRenderingMode(.monochrome)
+                        .foregroundStyle(color.opacity(0.9))
+                }
+            }
+            .frame(width: ringSize, height: ringSize)
+
+            if countdownAt == nil {
+                Text("\(Int(max(0, min(100, value))))%")
+                    .font(.system(size: 12.5 * scale, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(theme.isLight ? Color(hex: 0x242628) : Color.white.opacity(0.9))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var palette: (orange: Color, usage: Color, reset: Color) {
+        switch theme {
+        case .eInk: return (Color(hex: 0xA85D00), Color(hex: 0x2868B2), Color(hex: 0x3A8B62))
+        case .marine: return (Color(hex: 0xF1B84B), Color(hex: 0x3B8FEA), Color(hex: 0x83E2AE))
+        case .retro: return (Color(hex: 0xFFB21F), Color(hex: 0x3182E8), Color(hex: 0x63E18A))
+        case .radar: return (Color(hex: 0xFFC34D), Color(hex: 0x2685E5), Color(hex: 0x6FE0AC))
+        case .oled, .current: return (Color(hex: 0xF2AD3E), Color(hex: 0x2F80ED), Color(hex: 0x68D9A0))
+        }
+    }
+
+    private var faceColor: Color {
+        switch theme {
+        case .eInk: return Color(hex: 0xF1EFE8).opacity(0.94)
+        case .marine: return Color(hex: 0x171A18).opacity(0.95)
+        case .retro: return Color.black.opacity(0.93)
+        case .radar: return Color(hex: 0x071319).opacity(0.92)
+        case .oled, .current: return Color(hex: 0x080B0E).opacity(0.94)
+        }
+    }
+
+    private var faceBorderColor: Color {
+        theme.isLight ? Color.black.opacity(0.22) : Color.white.opacity(0.07)
+    }
+
+    private var trackOpacity: Double {
+        theme.isLight ? 0.18 : 0.13
     }
 }
 
@@ -4178,6 +5940,18 @@ private struct MountedRingActionView: NSViewRepresentable {
                 guard let self, let view = self.view, event.window === view.window else { return event }
                 let point = view.convert(event.locationInWindow, from: nil)
                 guard view.bounds.contains(point) else { return event }
+                if self.position.isEdge {
+                    let fraction: CGFloat
+                    if self.position == .left || self.position == .right {
+                        fraction = 1 - (point.y / max(1, view.bounds.height))
+                    } else {
+                        fraction = point.x / max(1, view.bounds.width)
+                    }
+                    if fraction < 1.0 / 3.0 { self.calendarAction() }
+                    else if fraction < 2.0 / 3.0 { self.usageAction() }
+                    else { self.resetAction() }
+                    return nil
+                }
                 let center: NSPoint
                 switch self.position {
                 case .topLeft: center = NSPoint(x: 0, y: view.bounds.maxY)
@@ -4223,6 +5997,10 @@ private struct MountedQuotaRings: View {
     let calendarProgress: Double
     let usageProgress: Double
     let resetProgress: Double
+    let calendarDetail: String
+    let usageDetail: String
+    let resetDetail: String
+    let resetCountdownAt: Date?
     let resetAnnounced: Bool
     let theme: WidgetTheme
     let position: DockPosition
@@ -4231,6 +6009,9 @@ private struct MountedQuotaRings: View {
         GeometryReader { geometry in
             let metrics = DockMetrics(position: position, size: geometry.size)
             let strokeBasis = min(geometry.size.width, geometry.size.height)
+            let calendarWidth = strokeBasis * (position.isCorner ? 0.032 : 0.075)
+            let usageWidth = strokeBasis * (position.isCorner ? 0.030 : 0.072)
+            let resetWidth = strokeBasis * (position.isCorner ? 0.028 : 0.067)
             ZStack {
                 Circle()
                     .fill(faceColor)
@@ -4242,48 +6023,90 @@ private struct MountedQuotaRings: View {
                     progress: calendarProgress,
                     color: palette.orange,
                     diameter: metrics.diameter * 0.82,
-                    width: strokeBasis * 0.075,
+                    width: calendarWidth,
                     metrics: metrics
                 )
-                mountedPercentage(
-                    progress: calendarProgress,
-                    color: palette.orange,
-                    diameter: metrics.diameter * 0.82,
-                    width: strokeBasis * 0.075,
-                    metrics: metrics,
-                    roundsDown: true
-                )
+                if position != .floating {
+                    mountedPercentage(
+                        progress: calendarProgress,
+                        color: palette.orange,
+                        diameter: metrics.diameter * 0.82,
+                        width: calendarWidth,
+                        metrics: metrics,
+                        roundsDown: true
+                    )
+                    mountedDetail(
+                        calendarDetail,
+                        progress: calendarProgress,
+                        color: palette.orange,
+                        diameter: metrics.diameter * 0.82,
+                        width: calendarWidth,
+                        metrics: metrics
+                    )
+                }
                 mountedRing(
                     progress: usageProgress,
-                    color: palette.green,
+                    color: palette.usage,
                     diameter: metrics.diameter * 0.61,
-                    width: strokeBasis * 0.072,
+                    width: usageWidth,
                     metrics: metrics
                 )
-                mountedPercentage(
-                    progress: usageProgress,
-                    color: palette.green,
-                    diameter: metrics.diameter * 0.61,
-                    width: strokeBasis * 0.072,
-                    metrics: metrics,
-                    roundsDown: false
-                )
+                if position != .floating {
+                    mountedPercentage(
+                        progress: usageProgress,
+                        color: palette.usage,
+                        diameter: metrics.diameter * 0.61,
+                        width: usageWidth,
+                        metrics: metrics,
+                        roundsDown: false
+                    )
+                    mountedDetail(
+                        usageDetail,
+                        progress: usageProgress,
+                        color: palette.usage,
+                        diameter: metrics.diameter * 0.61,
+                        width: usageWidth,
+                        metrics: metrics
+                    )
+                }
                 mountedRing(
                     progress: resetProgress,
-                    color: palette.blue,
+                    color: palette.reset,
                     diameter: metrics.diameter * 0.40,
-                    width: strokeBasis * 0.067,
+                    width: resetWidth,
                     metrics: metrics,
                     alerting: resetAnnounced
                 )
-                mountedPercentage(
-                    progress: resetProgress,
-                    color: palette.blue,
-                    diameter: metrics.diameter * 0.40,
-                    width: strokeBasis * 0.067,
-                    metrics: metrics,
-                    roundsDown: false
-                )
+                if position != .floating {
+                    if let resetCountdownAt {
+                        TimelineView(.periodic(from: .now, by: 30)) { context in
+                            mountedResetCountdown(
+                                to: resetCountdownAt,
+                                now: context.date,
+                                color: palette.reset,
+                                diameter: metrics.diameter * 0.40,
+                                metrics: metrics
+                            )
+                        }
+                    } else {
+                        mountedPercentage(
+                            progress: resetProgress,
+                            color: palette.reset,
+                            diameter: metrics.diameter * 0.40,
+                            width: resetWidth,
+                            metrics: metrics,
+                            roundsDown: false
+                        )
+                        mountedDetail(
+                            resetDetail,
+                            progress: resetProgress,
+                            color: palette.reset,
+                            diameter: metrics.diameter * 0.40,
+                            width: resetWidth,
+                            metrics: metrics
+                        )
+                    }
+                }
             }
         }
         .accessibilityElement(children: .ignore)
@@ -4361,49 +6184,124 @@ private struct MountedQuotaRings: View {
         roundsDown: Bool
     ) -> some View {
         let visibleValue = roundsDown ? progress.rounded(.down) : progress.rounded()
+        let scale = metrics.readoutScale
         return Text("\(Int(max(0, min(100, visibleValue))))%")
-            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .font(.system(size: 9 * scale, weight: .bold, design: .monospaced))
             .monospacedDigit()
             .foregroundStyle(color)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
-            .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(theme.isLight ? Color.white.opacity(0.82) : Color(hex: 0x080B0E).opacity(0.82))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            .stroke(color.opacity(0.22), lineWidth: 0.7)
-                    )
-            )
+            .shadow(color: faceColor.opacity(0.9), radius: 2 * scale)
             .position(percentagePosition(progress: progress, diameter: diameter, width: width, metrics: metrics))
             .allowsHitTesting(false)
+    }
+
+    private func mountedResetCountdown(
+        to expectedAt: Date,
+        now: Date,
+        color: Color,
+        diameter: CGFloat,
+        metrics: DockMetrics
+    ) -> some View {
+        let scale = metrics.readoutScale
+        return VStack(spacing: 1 * scale) {
+            Image(systemName: "hourglass")
+                .font(.system(size: 7 * scale, weight: .bold))
+            Text(ResetCountdownLabel.short(to: expectedAt, now: now))
+                .font(.system(size: 8 * scale, weight: .bold, design: .monospaced))
+                .monospacedDigit()
+        }
+        .foregroundStyle(color)
+        .lineLimit(1)
+        .shadow(color: faceColor.opacity(0.9), radius: 2 * scale)
+        .position(resetCountdownPosition(diameter: diameter, metrics: metrics))
+        .allowsHitTesting(false)
+    }
+
+    private func resetCountdownPosition(diameter: CGFloat, metrics: DockMetrics) -> CGPoint {
+        let angle = CGFloat(metrics.arc.start + metrics.arc.sweep * 0.66) * .pi / 180
+        let radius = diameter * 0.30
+        return CGPoint(
+            x: metrics.center.x + cos(angle) * radius,
+            y: metrics.center.y + sin(angle) * radius
+        )
     }
 
     private func percentagePosition(progress: Double, diameter: CGFloat, width: CGFloat, metrics: DockMetrics) -> CGPoint {
         let fraction = max(0, min(1, progress / 100))
         let angle = CGFloat(metrics.arc.start + metrics.arc.sweep * fraction) * .pi / 180
+        let scale = metrics.readoutScale
         // Pull the number just inside its live endpoint, then clamp it away
         // from the clipped screen boundary so every value remains legible.
         let radius = metrics.position == .floating
             ? diameter / 2 + width / 2 + 8
-            : max(8, diameter / 2 - width / 2 - 14)
+            : max(8, diameter / 2 - width / 2 - 14 * scale)
         let raw = CGPoint(
             x: metrics.center.x + cos(angle) * radius,
             y: metrics.center.y + sin(angle) * radius
         )
         return CGPoint(
-            x: min(max(raw.x, 19), max(19, metrics.size.width - 19)),
-            y: min(max(raw.y, 12), max(12, metrics.size.height - 12))
+            x: min(max(raw.x, 19 * scale), max(19 * scale, metrics.size.width - 19 * scale)),
+            y: min(max(raw.y, 12 * scale), max(12 * scale, metrics.size.height - 12 * scale))
         )
     }
 
-    private var palette: (orange: Color, green: Color, blue: Color) {
+    private func mountedDetail(
+        _ text: String,
+        progress: Double,
+        color: Color,
+        diameter: CGFloat,
+        width: CGFloat,
+        metrics: DockMetrics
+    ) -> some View {
+        let scale = metrics.readoutScale
+        return Text(text)
+            .font(.system(size: (metrics.position == .floating ? 6.5 : 7) * scale, weight: .semibold, design: .monospaced))
+            .monospacedDigit()
+            .lineLimit(1)
+            .minimumScaleFactor(0.78)
+            .foregroundStyle(color.opacity(0.92))
+            .frame(maxWidth: (metrics.position == .floating ? 68 : 82) * scale)
+            .frame(height: 15 * scale)
+            .shadow(color: faceColor.opacity(0.9), radius: 2 * scale)
+            .position(detailPosition(progress: progress, diameter: diameter, width: width, metrics: metrics))
+            .allowsHitTesting(false)
+    }
+
+    private func detailPosition(progress: Double, diameter: CGFloat, width: CGFloat, metrics: DockMetrics) -> CGPoint {
+        let fraction = max(0, min(1, progress / 100))
+        let scale = metrics.readoutScale
+        let angleDegrees: Double
+        if metrics.position == .floating {
+            angleDegrees = metrics.arc.start + metrics.arc.sweep * fraction + 180
+        } else {
+            // Use the unoccupied end of the visible arc. This keeps the label
+            // opposite the moving percentage without allowing the two pills
+            // to meet in the middle of a half- or quarter-circle.
+            let detailFraction = fraction <= 0.5 ? 0.88 : 0.12
+            angleDegrees = metrics.arc.start + metrics.arc.sweep * detailFraction
+        }
+        let angle = CGFloat(angleDegrees) * .pi / 180
+        let radius = metrics.position == .floating
+            ? diameter / 2 - width / 2 - 9
+            : max(8, diameter / 2 - width / 2 - 14 * scale)
+        let raw = CGPoint(
+            x: metrics.center.x + cos(angle) * radius,
+            y: metrics.center.y + sin(angle) * radius
+        )
+        let horizontalInset: CGFloat = (metrics.position == .floating ? 28 : 34) * scale
+        return CGPoint(
+            x: min(max(raw.x, horizontalInset), max(horizontalInset, metrics.size.width - horizontalInset)),
+            y: min(max(raw.y, 10 * scale), max(10 * scale, metrics.size.height - 10 * scale))
+        )
+    }
+
+    private var palette: (orange: Color, usage: Color, reset: Color) {
         switch theme {
-        case .eInk: return (Color(hex: 0xA85D00), Color(hex: 0x18704B), Color(hex: 0x17658F))
-        case .marine: return (Color(hex: 0xF1B84B), Color(hex: 0x83E2AE), Color(hex: 0x5DAFE5))
-        case .retro: return (Color(hex: 0xFFB21F), Color(hex: 0x63E18A), Color(hex: 0x3EA9F5))
-        case .radar: return (Color(hex: 0xFFC34D), Color(hex: 0x71E3AC), Color(hex: 0x46B8F4))
-        case .oled, .current: return (Color(hex: 0xF2AD3E), Color(hex: 0x7EE6AE), Color(hex: 0x58B9F3))
+        case .eInk: return (Color(hex: 0xA85D00), Color(hex: 0x2868B2), Color(hex: 0x3A8B62))
+        case .marine: return (Color(hex: 0xF1B84B), Color(hex: 0x3B8FEA), Color(hex: 0x83E2AE))
+        case .retro: return (Color(hex: 0xFFB21F), Color(hex: 0x3182E8), Color(hex: 0x63E18A))
+        case .radar: return (Color(hex: 0xFFC34D), Color(hex: 0x2685E5), Color(hex: 0x6FE0AC))
+        case .oled: return (Color(hex: 0xF2AD3E), Color(hex: 0x2F80ED), Color(hex: 0x68D9A0))
+        case .current: return (Color(hex: 0xDDA13A), Color(hex: 0x4B7DE8), Color(hex: 0x72C992))
         }
     }
 
@@ -4419,29 +6317,29 @@ private struct MountedQuotaRings: View {
     }
 
     private var faceBorderColor: Color {
-        theme.isLight ? Color.black.opacity(0.34) : Color.white.opacity(theme == .marine ? 0.2 : 0.1)
+        theme.isLight ? Color.black.opacity(0.28) : Color.white.opacity(theme == .marine ? 0.16 : 0.06)
     }
 
     private var trackOpacity: Double { theme == .eInk ? 0.34 : (theme == .marine ? 0.22 : 0.15) }
-    private var shadowOpacity: Double { theme == .eInk ? 0 : (theme == .marine ? 0.22 : 0.44) }
+    private var shadowOpacity: Double { theme == .eInk ? 0 : (theme == .marine ? 0.14 : 0.12) }
 }
 
 /// Codex Fast-style motion: several low-contrast blue bands flow inside the
 /// existing reset fill. The animation is timer-driven at five frames per second.
 private enum ResetAlertBar {
-    static let highlight = Color(hex: 0xBCE8FF)
+    static let highlight = Color(hex: 0xC4F7D8)
     static let flowingGradient = Gradient(stops: [
-        .init(color: Color(hex: 0x58B9F3), location: 0.00),
-        .init(color: Color(hex: 0x58B9F3), location: 0.07),
-        .init(color: Color(hex: 0xBCE8FF), location: 0.12),
-        .init(color: Color(hex: 0x58B9F3), location: 0.18),
-        .init(color: Color(hex: 0x58B9F3), location: 0.39),
-        .init(color: Color(hex: 0xA6DFFF), location: 0.45),
-        .init(color: Color(hex: 0x58B9F3), location: 0.51),
-        .init(color: Color(hex: 0x58B9F3), location: 0.72),
-        .init(color: Color(hex: 0xBCE8FF), location: 0.78),
-        .init(color: Color(hex: 0x58B9F3), location: 0.84),
-        .init(color: Color(hex: 0x58B9F3), location: 1.00),
+        .init(color: Color(hex: 0x68D9A0), location: 0.00),
+        .init(color: Color(hex: 0x68D9A0), location: 0.07),
+        .init(color: Color(hex: 0xC4F7D8), location: 0.12),
+        .init(color: Color(hex: 0x68D9A0), location: 0.18),
+        .init(color: Color(hex: 0x68D9A0), location: 0.39),
+        .init(color: Color(hex: 0xA8EDC5), location: 0.45),
+        .init(color: Color(hex: 0x68D9A0), location: 0.51),
+        .init(color: Color(hex: 0x68D9A0), location: 0.72),
+        .init(color: Color(hex: 0xC4F7D8), location: 0.78),
+        .init(color: Color(hex: 0x68D9A0), location: 0.84),
+        .init(color: Color(hex: 0x68D9A0), location: 1.00),
     ])
 
     static func phase(at date: Date) -> Double {
@@ -4463,7 +6361,7 @@ private enum ResetAlertBar {
         let cycle = (position * 3 + phase * 3).truncatingRemainder(dividingBy: 1)
         let distance = abs(cycle - 0.5)
         if distance < 0.10 { return highlight }
-        if distance < 0.19 { return Color(hex: 0x83CEF7) }
+        if distance < 0.19 { return Color(hex: 0x91E8B8) }
         return base
     }
 }
@@ -4511,8 +6409,8 @@ private struct CompactQuotaRings: View {
                     )
 
                 ring(progress: calendarProgress, color: palette.orange, diameter: side * 0.82, width: side * 0.075)
-                ring(progress: usageProgress, color: palette.green, diameter: side * 0.61, width: side * 0.072)
-                ring(progress: resetProgress, color: palette.blue, diameter: side * 0.40, width: side * 0.067)
+                ring(progress: usageProgress, color: palette.usage, diameter: side * 0.61, width: side * 0.072)
+                ring(progress: resetProgress, color: palette.reset, diameter: side * 0.40, width: side * 0.067)
 
                 Circle()
                     .fill(theme.isLight ? Color.black.opacity(0.34) : Color.white.opacity(0.14))
@@ -4549,18 +6447,18 @@ private struct CompactQuotaRings: View {
         .frame(width: diameter, height: diameter)
     }
 
-    private var palette: (orange: Color, green: Color, blue: Color) {
+    private var palette: (orange: Color, usage: Color, reset: Color) {
         switch theme {
         case .eInk:
-            return (Color(hex: 0xA85D00), Color(hex: 0x18704B), Color(hex: 0x17658F))
+            return (Color(hex: 0xA85D00), Color(hex: 0x2868B2), Color(hex: 0x3A8B62))
         case .marine:
-            return (Color(hex: 0xF1B84B), Color(hex: 0x83E2AE), Color(hex: 0x5DAFE5))
+            return (Color(hex: 0xF1B84B), Color(hex: 0x3B8FEA), Color(hex: 0x83E2AE))
         case .retro:
-            return (Color(hex: 0xFFB21F), Color(hex: 0x63E18A), Color(hex: 0x3EA9F5))
+            return (Color(hex: 0xFFB21F), Color(hex: 0x3182E8), Color(hex: 0x63E18A))
         case .radar:
-            return (Color(hex: 0xFFC34D), Color(hex: 0x71E3AC), Color(hex: 0x46B8F4))
+            return (Color(hex: 0xFFC34D), Color(hex: 0x2685E5), Color(hex: 0x6FE0AC))
         case .oled, .current:
-            return (Color(hex: 0xF2AD3E), Color(hex: 0x7EE6AE), Color(hex: 0x58B9F3))
+            return (Color(hex: 0xF2AD3E), Color(hex: 0x2F80ED), Color(hex: 0x68D9A0))
         }
     }
 
@@ -4668,12 +6566,21 @@ private struct CompactRingActionView: NSViewRepresentable {
 
 struct ResetCalculatorPopover: View {
     let snapshot: ForecastSnapshot?
+    let effectiveScore: Double?
+    let announcementActive: Bool
     let status: String
+    let lifecycle: ResetLifecycleSnapshot
+    let theme: WidgetTheme
+
+    private var palette: PopoverPalette { theme.popoverPalette }
 
     private var detailProvider: ResetProviderSnapshot? {
         guard let snapshot else { return nil }
-        if snapshot.source == .average {
-            return snapshot.providers.first { $0.source == .lunarWerx } ?? snapshot.providers.first
+        if snapshot.selectedSources.count > 1 {
+            return ForecastSource.calculatorCases
+                .filter(snapshot.selectedSources.contains)
+                .compactMap { source in snapshot.providers.first { $0.source == source } }
+                .first
         }
         return snapshot.providers.first { $0.source == snapshot.source }
     }
@@ -4683,72 +6590,79 @@ struct ResetCalculatorPopover: View {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(Color(hex: 0x58B9F3))
+                    .foregroundStyle(palette.reset)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("RESET CALCULATOR")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color.white.opacity(0.48))
-                    Text(snapshot?.source.displayName ?? "Reset estimate")
+                        .foregroundStyle(palette.tertiary)
+                    Text(snapshot.map { ForecastSourceSelection.label(for: $0.selectedSources) } ?? "Reset estimate")
                         .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.94))
+                        .foregroundStyle(palette.primary.opacity(0.94))
                 }
                 Spacer()
                 Text(updatedLabel)
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.38))
+                    .foregroundStyle(palette.tertiary)
             }
 
             if let snapshot {
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text("\(Int(snapshot.score.rounded()))%")
-                        .font(.system(size: 40, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.95))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("NEXT 24 HOURS")
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundStyle(Color(hex: 0x58B9F3))
-                        if let range = snapshot.range {
-                            Text("range \(Int(range.lowerBound.rounded()))–\(Int(range.upperBound.rounded()))%")
-                                .font(.system(size: 10, weight: .medium, design: .rounded))
-                                .foregroundStyle(Color.white.opacity(0.5))
-                        }
-                    }
-                }
+                resetScoreHeader(snapshot)
 
-                if let schedule = snapshot.scheduledReset, schedule.expectedAt > Date().addingTimeInterval(-5 * 60) {
-                    TimelineView(.periodic(from: .now, by: 30)) { _ in
+                if let timing = displayedTiming(for: snapshot) {
+                    let expectedAt = timing.expectedAt
+                    let isConfirmedAnnouncement = timing.confirmed
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
                         HStack(spacing: 10) {
                             Image(systemName: "hourglass")
                                 .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(Color(hex: 0x58B9F3))
+                                .foregroundStyle(palette.reset)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("RESET COUNTDOWN")
+                                Text(isConfirmedAnnouncement
+                                    ? (expectedAt <= context.date ? "RESET DELAYED" : "RESET COUNTDOWN")
+                                    : "FORECAST WINDOW")
                                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(Color.white.opacity(0.42))
-                                Text(schedule.expectedAt, style: .timer)
-                                    .font(.system(size: 20, weight: .semibold, design: .rounded))
-                                    .monospacedDigit()
-                                    .foregroundStyle(Color.white.opacity(0.94))
+                                    .foregroundStyle(palette.tertiary)
+                                if isConfirmedAnnouncement && expectedAt <= context.date {
+                                    Text("WAITING FOR RESET")
+                                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                                        .foregroundStyle(palette.primary.opacity(0.94))
+                                } else {
+                                    Text(isConfirmedAnnouncement ? "RESET IN" : "BY")
+                                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(palette.tertiary)
+                                    Text(expectedAt, style: .timer)
+                                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                                        .monospacedDigit()
+                                        .foregroundStyle(palette.primary.opacity(0.94))
+                                }
                             }
                             Spacer()
                             VStack(alignment: .trailing, spacing: 3) {
-                                Text(schedule.expectedAt.formatted(date: .abbreviated, time: .shortened))
+                                Text(expectedAt.formatted(date: .abbreviated, time: .shortened))
                                     .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                Text(Self.timeZoneLabel(for: schedule.expectedAt))
+                                Text(Self.timeZoneLabel(for: expectedAt))
                                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(Color(hex: 0x58B9F3))
+                                    .foregroundStyle(palette.reset)
                             }
                         }
                         .padding(11)
-                        .background(RoundedRectangle(cornerRadius: 11).fill(Color(hex: 0x58B9F3).opacity(0.09)))
+                        .background(
+                            RoundedRectangle(cornerRadius: 9)
+                                .fill(palette.reset.opacity(theme == .eInk ? 0.12 : 0.08))
+                                .overlay(RoundedRectangle(cornerRadius: 9).stroke(palette.reset.opacity(0.4), lineWidth: 0.8))
+                        )
                     }
                 }
 
-                if let headline = snapshot.headline, !headline.isEmpty {
+                if let headline = effectiveHeadline(for: snapshot), !headline.isEmpty {
                     Text(headline)
                         .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.76))
+                        .foregroundStyle(palette.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let hedge = snapshot.providers.compactMap(\.polymarketHedge).first {
+                    polymarketHedgeCard(hedge)
                 }
 
                 if let provider = detailProvider, !provider.metrics.isEmpty {
@@ -4763,21 +6677,21 @@ struct ResetCalculatorPopover: View {
                     VStack(alignment: .leading, spacing: 7) {
                         Text("ACTIVE SIGNALS")
                             .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundStyle(Color.white.opacity(0.38))
+                            .foregroundStyle(palette.tertiary)
                         ForEach(provider.signals.prefix(3)) { signal in
                             HStack(alignment: .top, spacing: 7) {
                                 Circle()
-                                    .fill(signal.value == "ACTIVE" ? Color(hex: 0x7EE6AE) : Color.white.opacity(0.28))
+                                    .fill(signal.value == "ACTIVE" ? palette.pace : palette.tertiary)
                                     .frame(width: 5, height: 5)
                                     .padding(.top, 4)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(signal.label)
                                         .font(.system(size: 10, weight: .semibold, design: .rounded))
-                                        .foregroundStyle(Color.white.opacity(0.78))
+                                        .foregroundStyle(palette.secondary)
                                     if let detail = signal.detail {
                                         Text(detail)
                                             .font(.system(size: 9, weight: .regular, design: .rounded))
-                                            .foregroundStyle(Color.white.opacity(0.44))
+                                            .foregroundStyle(palette.tertiary)
                                             .lineLimit(2)
                                     }
                                 }
@@ -4786,7 +6700,7 @@ struct ResetCalculatorPopover: View {
                     }
                 }
 
-                Divider().overlay(Color.white.opacity(0.09))
+                Divider().overlay(palette.rule)
 
                 VStack(spacing: 5) {
                     ForEach(ForecastSource.calculatorCases) { source in
@@ -4796,42 +6710,143 @@ struct ResetCalculatorPopover: View {
             } else {
                 Text(status)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.6))
+                    .foregroundStyle(palette.secondary)
                     .padding(.vertical, 20)
             }
         }
-        .padding(15)
+        .padding(16)
         .frame(width: 380)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(hex: 0x101419))
+            RoundedRectangle(cornerRadius: palette.cornerRadius, style: .continuous)
+                .fill(palette.background)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: palette.cornerRadius, style: .continuous)
+                        .stroke(palette.rule, lineWidth: 1)
                 )
         )
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.isLight ? .light : .dark)
+    }
+
+    private func resetScoreHeader(_ snapshot: ForecastSnapshot) -> some View {
+        let score = max(0, min(100, effectiveScore ?? snapshot.score))
+        return ZStack(alignment: .bottom) {
+            ZStack {
+                Circle()
+                    .trim(from: 0.50, to: 1.0)
+                    .stroke(palette.rule, style: StrokeStyle(lineWidth: 7, lineCap: .butt, dash: [7, 3]))
+                Circle()
+                    .trim(from: 0.50, to: 0.50 + 0.50 * score / 100)
+                    .stroke(palette.reset, style: StrokeStyle(lineWidth: 7, lineCap: .butt, dash: [7, 3]))
+            }
+            .frame(width: 176, height: 176)
+            .frame(height: 88, alignment: .top)
+            .clipped()
+
+            VStack(spacing: 1) {
+                Text("\(Int(score.rounded()))%")
+                    .font(.system(size: 44, weight: .light, design: palette.numberDesign))
+                    .monospacedDigit()
+                    .foregroundStyle(palette.primary)
+                Text(snapshot.source == .polymarket
+                    ? "BY \(snapshot.providers.compactMap(\.polymarketHedge).first?.marketLabel.uppercased() ?? "MARKET DEADLINE")"
+                    : "NEXT 24 HOURS")
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .tracking(0.8)
+                    .foregroundStyle(palette.reset)
+                if let range = snapshot.range {
+                    Text("range \(Int(range.lowerBound.rounded()))–\(Int(range.upperBound.rounded()))%")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(palette.tertiary)
+                }
+            }
+            .padding(.bottom, 2)
+        }
+        .frame(maxWidth: .infinity, minHeight: 108)
+        .clipped()
+        .accessibilityElement(children: .combine)
     }
 
     private func metricTile(_ metric: ResetMetric) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(metric.label.uppercased())
                 .font(.system(size: 7, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.36))
+                .foregroundStyle(palette.tertiary)
                 .lineLimit(1)
             Text(metric.value)
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                .foregroundStyle(Color.white.opacity(0.86))
+                .font(.system(size: 14, weight: .semibold, design: palette.numberDesign))
+                .foregroundStyle(palette.primary.opacity(0.9))
             if let detail = metric.detail {
                 Text(detail)
                     .font(.system(size: 8, weight: .regular, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.38))
+                    .foregroundStyle(palette.tertiary)
                     .lineLimit(1)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
-        .background(RoundedRectangle(cornerRadius: 9).fill(Color.white.opacity(0.045)))
+        .background(RoundedRectangle(cornerRadius: 8).fill(palette.surface))
+    }
+
+    private func polymarketHedgeCard(_ hedge: PolymarketResetHedge) -> some View {
+        Button {
+            NSWorkspace.shared.open(hedge.url)
+        } label: {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 7) {
+                    Image(systemName: "chart.line.uptrend.xyaxis")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(palette.reset)
+                    Text("CHEAPER RESET · POLYMARKET")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(palette.tertiary)
+                    Spacer()
+                    Text("NO \(Int((hedge.noPrice * 100).rounded()))¢")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(palette.reset)
+                }
+
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Bet $\(hedge.stake, specifier: "%.2f") on No")
+                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .foregroundStyle(palette.primary)
+                        Text("No reset by \(hedge.marketLabel) → $80 gross payout")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(palette.secondary)
+                    }
+                    Spacer(minLength: 12)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("+$\(hedge.grossProfit, specifier: "%.2f")")
+                            .font(.system(size: 15, weight: .semibold, design: palette.numberDesign))
+                            .foregroundStyle(palette.reset)
+                        Text("profit")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundStyle(palette.tertiary)
+                    }
+                }
+
+                HStack {
+                    Text("Reset happens: lose the stake, receive the quota reset")
+                    Spacer()
+                    Text("VIEW ↗")
+                }
+                .font(.system(size: 8, weight: .medium, design: .monospaced))
+                .foregroundStyle(palette.tertiary)
+
+                Text("LIVE INDICATIVE PRICE · BEFORE FEES AND SLIPPAGE")
+                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                    .foregroundStyle(palette.tertiary.opacity(0.8))
+            }
+            .padding(11)
+            .background(
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(palette.surface)
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(palette.reset.opacity(0.32), lineWidth: 0.8))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("View the earliest Codex reset market. Prices move; figures exclude fees and slippage.")
     }
 
     private func providerRow(_ source: ForecastSource, provider: ResetProviderSnapshot?) -> some View {
@@ -4840,18 +6855,28 @@ struct ResetCalculatorPopover: View {
         } label: {
             HStack(spacing: 9) {
                 Circle()
-                    .fill(provider == nil ? Color.white.opacity(0.16) : Color(hex: 0x58B9F3))
+                    .fill(provider == nil ? palette.rule : palette.reset)
                     .frame(width: 6, height: 6)
                 Text(source.displayName)
                     .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.72))
+                    .foregroundStyle(palette.secondary)
                 Spacer()
+                if let score = provider?.score {
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(palette.rule)
+                            Capsule().fill(palette.reset)
+                                .frame(width: geometry.size.width * max(0, min(1, score / 100)))
+                        }
+                    }
+                    .frame(width: 72, height: 2)
+                }
                 Text(provider?.score.map { "\(Int($0.rounded()))%" } ?? "—")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(provider == nil ? Color.white.opacity(0.28) : Color.white.opacity(0.78))
+                    .foregroundStyle(provider == nil ? palette.tertiary : palette.primary.opacity(0.78))
                 Image(systemName: "arrow.up.right")
                     .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.28))
+                    .foregroundStyle(palette.tertiary)
             }
             .padding(.horizontal, 8)
             .frame(height: 28)
@@ -4874,6 +6899,18 @@ struct ResetCalculatorPopover: View {
         formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = "z"
         return "YOUR TIME · \(formatter.string(from: date).uppercased())"
+    }
+
+    private func displayedTiming(for snapshot: ForecastSnapshot) -> (expectedAt: Date, confirmed: Bool)? {
+        guard announcementActive else { return nil }
+        return lifecycle.activeExpectedAt().map { ($0, true) }
+    }
+
+    private func effectiveHeadline(for snapshot: ForecastSnapshot) -> String? {
+        if snapshot.announcement?.requiresApplicabilityConfirmation == true && !announcementActive {
+            return "This reset does not apply to your account. Showing the selected calculator percentages."
+        }
+        return snapshot.headline
     }
 }
 
@@ -5080,7 +7117,10 @@ private struct NewTweetAlertPopover: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 240)
+            // A max height alone lets a popover collapse the scroll view to a
+            // single line. Size it from the post and reply first, then scroll
+            // only when an unusually long thread would take over the screen.
+            .frame(height: messageBodyHeight)
 
             HStack(spacing: 8) {
                 Button("View all posts", action: onOpenFeed)
@@ -5092,9 +7132,43 @@ private struct NewTweetAlertPopover: View {
             }
         }
         .padding(15)
-        .frame(width: 350)
+        .frame(width: 380)
         .background(Color(hex: 0x101419))
         .preferredColorScheme(.dark)
+    }
+
+    private var messageBodyHeight: CGFloat {
+        let tweetHeight = measuredHeight(
+            tweet.text,
+            font: .systemFont(ofSize: 12, weight: .medium),
+            width: 350
+        )
+
+        let replyHeight: CGFloat
+        if let reply = tweet.inReplyTo, !reply.isEmpty {
+            replyHeight = measuredHeight(
+                reply,
+                font: .systemFont(ofSize: 10, weight: .medium),
+                width: 306
+            ) + 18
+        } else {
+            replyHeight = 0
+        }
+
+        let spacing = replyHeight > 0 ? CGFloat(8) : 0
+        // SwiftUI's rounded fonts and the reply icon can add a little more
+        // vertical leading than AppKit reports. Keep a small allowance so an
+        // otherwise fully visible post does not get a pointless scrollbar.
+        return min(500, max(54, ceil(tweetHeight + replyHeight + spacing + 28)))
+    }
+
+    private func measuredHeight(_ text: String, font: NSFont, width: CGFloat) -> CGFloat {
+        let bounds = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font]
+        )
+        return ceil(bounds.height)
     }
 
     private var ageLabel: String {
@@ -5242,6 +7316,7 @@ private struct UsagePace {
         usageHistory: [UsageCheckpoint],
         localTokensTotal: Int64?,
         localTokenPace: LocalTokenPaceSnapshot?,
+        usageIntelligence: UsageIntelligenceSnapshot? = nil,
         rate: UsagePaceRate,
         now: Date = Date()
     ) -> UsagePace {
@@ -5273,7 +7348,8 @@ private struct UsagePace {
                 (
                     date: $0.recordedAt,
                     percent: max(0, min(100, $0.usedPercent)),
-                    localTokens: $0.localTokensTotal
+                    localTokens: $0.localTokensTotal,
+                    quotaCost: $0.quotaWeightedUSD ?? $0.apiEquivalentUSD
                 )
             }
             .sorted { $0.date < $1.date }
@@ -5283,7 +7359,8 @@ private struct UsagePace {
                 (
                     date: now,
                     percent: max(0, min(100, usedPercent)),
-                    localTokens: localTokensTotal
+                    localTokens: localTokensTotal,
+                    quotaCost: usageIntelligence?.quotaWeightedUSD
                 )
             )
         }
@@ -5362,7 +7439,18 @@ private struct UsagePace {
                     endingAt: current.date
                 )
             }()
-            if let tokenBurn, tokenBurn > 0,
+            let costBurn = observedCostBurn(
+                from: readings,
+                duration: coveredDuration,
+                endingAt: current.date
+            )
+            if let costBurn, costBurn > 0,
+               let percentPerDollar = recentPercentPerDollar(from: readings) {
+                percentPerSecond = (costBurn / coveredDuration) * percentPerDollar
+                basis = coveredDuration < interval - 30
+                    ? "Cost-implied " + formatDuration(coveredDuration) + " pace"
+                    : "Cost-implied " + rate.basisLabel.lowercased()
+            } else if let tokenBurn, tokenBurn > 0,
                let percentPerToken = recentPercentPerToken(from: readings) {
                 // Every rolling rate uses a token burn aligned to the exact
                 // covered duration and the same robust recent-step pricing.
@@ -5434,7 +7522,7 @@ private struct UsagePace {
     }
 
     private static func cappedObservedTokenBurn(
-        from readings: [(date: Date, percent: Double, localTokens: Int64?)],
+        from readings: [(date: Date, percent: Double, localTokens: Int64?, quotaCost: Double?)],
         duration: TimeInterval,
         endingAt end: Date
     ) -> Int64? {
@@ -5465,7 +7553,7 @@ private struct UsagePace {
     }
 
     private static func recentPercentPerToken(
-        from readings: [(date: Date, percent: Double, localTokens: Int64?)]
+        from readings: [(date: Date, percent: Double, localTokens: Int64?, quotaCost: Double?)]
     ) -> Double? {
         let tokenReadings = readings.compactMap { reading -> (percent: Double, tokens: Int64)? in
             guard let tokens = reading.localTokens else { return nil }
@@ -5493,6 +7581,46 @@ private struct UsagePace {
         return median
     }
 
+    private static func observedCostBurn(
+        from readings: [(date: Date, percent: Double, localTokens: Int64?, quotaCost: Double?)],
+        duration: TimeInterval,
+        endingAt end: Date
+    ) -> Double? {
+        let cutoff = end.addingTimeInterval(-duration - 1)
+        let values = readings.filter { $0.date >= cutoff }.compactMap {
+            reading -> (date: Date, cost: Double)? in
+            guard let cost = reading.quotaCost, cost.isFinite, cost >= 0 else { return nil }
+            return (reading.date, cost)
+        }.sorted { $0.date < $1.date }
+        guard let first = values.first, let last = values.last, last.date > first.date else { return nil }
+        return max(0, last.cost - first.cost)
+    }
+
+    private static func recentPercentPerDollar(
+        from readings: [(date: Date, percent: Double, localTokens: Int64?, quotaCost: Double?)]
+    ) -> Double? {
+        let costReadings = readings.compactMap { reading -> (percent: Double, cost: Double)? in
+            guard let cost = reading.quotaCost, cost.isFinite, cost >= 0 else { return nil }
+            return (reading.percent, cost)
+        }
+        guard var milestone = costReadings.first else { return nil }
+        var calibrations: [Double] = []
+        for reading in costReadings.dropFirst() {
+            let percentDelta = reading.percent - milestone.percent
+            let costDelta = reading.cost - milestone.cost
+            guard percentDelta >= 0.5, costDelta > 0.000_001 else { continue }
+            calibrations.append(percentDelta / costDelta)
+            milestone = reading
+        }
+        let recent = Array(calibrations.suffix(5)).sorted()
+        guard recent.count >= 2 else { return nil }
+        let middle = recent.count / 2
+        let median = recent.count.isMultiple(of: 2)
+            ? (recent[middle - 1] + recent[middle]) / 2
+            : recent[middle]
+        return median.isFinite && median > 0 ? median : nil
+    }
+
     private static func formatDuration(_ interval: TimeInterval) -> String {
         let totalMinutes = max(1, Int(interval / 60))
         let days = totalMinutes / (24 * 60)
@@ -5512,12 +7640,28 @@ struct UsageChartPopover: View {
     let weeklyTokens: Int64?
     let localTokensTotal: Int64?
     let localTokenPace: LocalTokenPaceSnapshot?
+    let usageIntelligence: UsageIntelligenceSnapshot?
+    let secondaryQuota: SecondaryQuotaSnapshot?
+    let quotaInventory: [CodexQuotaWindow]
+    let creditSummary: CodexCreditSummary?
+    let resetCredits: [CodexResetCredit]
+    let activeTasks: [CodexTaskSnapshot]
+    let weeklyArchives: [WeeklyUsageArchive]
     let usedPercent: Double?
     let windowStartDate: Date?
     let resetAt: Date?
     let paceRate: UsagePaceRate
+    let theme: WidgetTheme
+    let onRebuildIntelligence: () -> Void
+    let onPurgeUsageData: () -> Void
     @State private var hoveredPoint: UsageHoverPoint?
     @State private var chartRange = UsageChartRange.window
+    @State private var showingIntelligence = false
+    @State private var showingQuotaDetails = false
+    @State private var showingHistory = false
+    @State private var weekOffset = 0
+
+    private var palette: PopoverPalette { theme.popoverPalette }
 
     private var pace: UsagePace {
         UsagePace.calculate(
@@ -5527,99 +7671,130 @@ struct UsageChartPopover: View {
             usageHistory: usageHistory,
             localTokensTotal: localTokensTotal,
             localTokenPace: localTokenPace,
+            usageIntelligence: usageIntelligence,
             rate: paceRate
         )
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if weekOffset > 0 {
+                weekNavigator
+            }
+
+            if let archive = selectedArchive {
+                ArchivedUsageWeekView(archive: archive)
+            } else {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(Color(hex: 0x7EE6AE))
+                    .fill(palette.pace)
                     .frame(width: 7, height: 7)
                 Text("CODEX / " + paceRate.compactLabel)
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
                     .tracking(1.1)
-                    .foregroundStyle(Color.white.opacity(0.48))
+                    .foregroundStyle(palette.tertiary)
                 Spacer()
-                Text("LIVE TOKENS")
-                    .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(hex: 0x7EE6AE).opacity(0.7))
+                if let intelligence = usageIntelligence {
+                    Text(intelligence.backfillComplete
+                        ? "\(Int((intelligence.pricingCoverage * 100).rounded()))% PRICED"
+                        : "INDEXING")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(palette.tertiary)
+                }
             }
 
             HStack(alignment: .bottom, spacing: 16) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(shortPaceTitle)
-                        .font(.system(size: 19, weight: .semibold, design: .rounded))
+                        .font(.system(size: 19, weight: .semibold, design: palette.numberDesign))
                         .foregroundStyle(statusColor)
                     Text(pace.detail)
                         .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.white.opacity(0.48))
+                        .foregroundStyle(palette.tertiary)
                         .lineLimit(2)
                 }
                 Spacer(minLength: 12)
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(pace.estimatedRunout.uppercased())
-                        .font(.system(size: 27, weight: .light, design: .rounded))
+                        .font(.system(size: 27, weight: .light, design: palette.numberDesign))
                         .monospacedDigit()
-                        .foregroundStyle(Color.white.opacity(0.94))
+                        .foregroundStyle(palette.primary.opacity(0.94))
                     Text("TO EMPTY")
                         .font(.system(size: 8, weight: .bold, design: .monospaced))
                         .tracking(1)
-                        .foregroundStyle(Color.white.opacity(0.34))
+                        .foregroundStyle(palette.tertiary)
                 }
             }
 
-            Rectangle().fill(statusColor).frame(height: 2)
+            statusTrack
+
+            if let intelligence = usageIntelligence {
+                intelligenceStrip(intelligence)
+            }
 
             HStack(spacing: 0) {
+                Button { showingQuotaDetails = true } label: {
+                    compactInsight(
+                        icon: "gauge.with.dots.needle.67percent",
+                        title: "ALLOWANCES",
+                        value: quotaInventory.isEmpty ? "GENERAL" : "\(quotaInventory.count) LIVE"
+                    )
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $showingQuotaDetails, arrowEdge: .top) {
+                    CodexAllowancePanel(
+                        windows: quotaInventory,
+                        credits: creditSummary,
+                        resetCredits: resetCredits,
+                        tasks: activeTasks
+                    )
+                }
+
+                Divider().overlay(palette.rule).padding(.vertical, 8)
+
+                Button { showingHistory = true } label: {
+                    compactInsight(
+                        icon: "square.grid.3x3.fill",
+                        title: "HISTORY",
+                        value: weeklyArchives.isEmpty ? "THIS WEEK" : "\(weeklyArchives.count + 1) WEEKS"
+                    )
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $showingHistory, arrowEdge: .top) {
+                    UsageHistoryOverview(
+                        currentHistory: usageHistory,
+                        currentWindowStart: windowStartDate,
+                        archives: weeklyArchives
+                    )
+                }
+
+                Divider().overlay(palette.rule).padding(.vertical, 8)
                 paceMetric("BURN", value: localTokenPace.map { formatTokens($0.tokens(for: paceRate)).replacingOccurrences(of: " TOKENS", with: "") } ?? "—")
                 paceMetric("USED", value: usedPercent.map { "\(Int($0.rounded()))%" } ?? "—")
                 paceMetric("SAMPLE", value: UsageHistoryStore.sampleIntervalDescription().uppercased())
             }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 58)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(palette.surface)
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(palette.rule, lineWidth: 0.7))
+            )
 
             HStack(spacing: 14) {
-                legend(color: Color(hex: 0x7EE6AE), label: "SAVED QUOTA + TOKENS")
-                legend(color: Color.white.opacity(0.5), label: "IDEAL", dotted: true)
+                legend(color: palette.pace, label: "QUOTA + TOKENS")
+                if usageIntelligence?.costTimeline.isEmpty == false {
+                    legend(color: palette.reset, label: "API COST")
+                }
+                legend(color: palette.secondary.opacity(0.6), label: "IDEAL", dotted: true)
                 Spacer()
                 Text("\(savedPointCount) SAVED · DISK")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.3))
+                    .foregroundStyle(palette.tertiary)
             }
-
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.34))
-                ForEach(UsageChartRange.allCases) { range in
-                    Button {
-                        hoveredPoint = nil
-                        chartRange = range
-                    } label: {
-                        Text(range.label)
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
-                            .foregroundStyle(
-                                chartRange == range
-                                    ? Color(hex: 0x101419)
-                                    : Color.white.opacity(0.48)
-                            )
-                            .background(
-                                Capsule().fill(
-                                    chartRange == range
-                                        ? Color(hex: 0x7EE6AE)
-                                        : Color.white.opacity(0.05)
-                                )
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .help("Choose a range, pinch to zoom, or double-click the chart to reset")
 
             if hoveredPoint != nil {
-                UsageHoverReadout(point: hoveredPoint)
+                UsageHoverReadout(point: hoveredPoint, theme: theme)
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
@@ -5632,26 +7807,161 @@ struct UsageChartPopover: View {
                 usedPercent: usedPercent,
                 windowStartDate: windowStartDate,
                 resetAt: resetAt,
+                usageIntelligence: usageIntelligence,
+                theme: theme,
                 range: $chartRange,
                 hoveredPoint: $hoveredPoint
             )
             .frame(height: 186)
+
+            rangeSelector
+            }
         }
         .padding(18)
-        .frame(width: 420)
+        .frame(width: 538)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color(hex: 0x101419))
+            RoundedRectangle(cornerRadius: palette.cornerRadius, style: .continuous)
+                .fill(palette.background)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color(hex: 0x7EE6AE).opacity(0.22), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: palette.cornerRadius, style: .continuous)
+                        .stroke(palette.pace.opacity(0.25), lineWidth: 1)
                 )
         )
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(theme.isLight ? .light : .dark)
+    }
+
+    private var selectedArchive: WeeklyUsageArchive? {
+        guard weekOffset > 0, weeklyArchives.indices.contains(weekOffset - 1) else { return nil }
+        return weeklyArchives[weekOffset - 1]
+    }
+
+    private func compactInsight(icon: String, title: String, value: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(palette.pace)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                    .tracking(0.7)
+                    .foregroundStyle(palette.tertiary)
+                    .lineLimit(1)
+                Text(value)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(palette.primary.opacity(0.82))
+                    .lineLimit(1)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(palette.tertiary)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .frame(width: 126, alignment: .leading)
+        .contentShape(RoundedRectangle(cornerRadius: 9))
+    }
+
+    private var weekNavigator: some View {
+        HStack(spacing: 8) {
+            Button {
+                weekOffset = min(weeklyArchives.count, weekOffset + 1)
+                hoveredPoint = nil
+            } label: {
+                Image(systemName: "chevron.left")
+                    .frame(width: 24, height: 22)
+            }
+            .buttonStyle(.plain)
+            .disabled(weekOffset >= weeklyArchives.count)
+
+            Text(selectedArchive.map {
+                $0.windowStart.formatted(.dateTime.month(.abbreviated).day())
+                    + " – "
+                    + $0.resetAt.formatted(.dateTime.month(.abbreviated).day())
+            } ?? "THIS WEEK")
+                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .tracking(0.8)
+                .foregroundStyle(palette.secondary.opacity(0.8))
+                .frame(maxWidth: .infinity)
+
+            Button {
+                weekOffset = max(0, weekOffset - 1)
+                hoveredPoint = nil
+            } label: {
+                Image(systemName: "chevron.right")
+                    .frame(width: 24, height: 22)
+            }
+            .buttonStyle(.plain)
+            .disabled(weekOffset == 0)
+        }
+        .foregroundStyle(palette.secondary)
+        .padding(.horizontal, 4)
+        .accessibilityElement(children: .contain)
     }
 
     private var statusColor: Color {
-        pace.title.contains("early") ? Color(hex: 0xF2AD3E) : Color(hex: 0x7EE6AE)
+        pace.title.contains("early") ? palette.billing : palette.pace
+    }
+
+    private var statusTrack: some View {
+        GeometryReader { geometry in
+            let progress = max(0.08, min(0.92, (usedPercent ?? 0) / 100))
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(statusColor.opacity(0.88))
+                    .frame(height: 1)
+                Circle()
+                    .fill(palette.background)
+                    .overlay(Circle().stroke(statusColor, lineWidth: 1.4))
+                    .frame(width: 9, height: 9)
+                    .offset(x: max(0, geometry.size.width * progress - 4.5))
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
+        }
+        .frame(height: 10)
+        .accessibilityHidden(true)
+    }
+
+    private var rangeSelector: some View {
+        HStack(spacing: 0) {
+            Button {
+                weekOffset = weekOffset == 0 ? min(1, weeklyArchives.count) : 0
+                hoveredPoint = nil
+            } label: {
+                Image(systemName: "safari")
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(width: 42, height: 30)
+                    .foregroundStyle(palette.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(weeklyArchives.isEmpty)
+            .help(weekOffset == 0 ? "Show previous week" : "Return to this week")
+
+            ForEach(UsageChartRange.allCases) { range in
+                Divider().overlay(palette.rule).padding(.vertical, 6)
+                Button {
+                    hoveredPoint = nil
+                    chartRange = range
+                } label: {
+                    Text(range.label)
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 30)
+                        .foregroundStyle(chartRange == range ? palette.pace : palette.tertiary)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(chartRange == range ? palette.pace : Color.clear)
+                                .frame(height: 2)
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+        }
+        .overlay(alignment: .top) { Rectangle().fill(palette.rule).frame(height: 1) }
+        .help("Choose a range, pinch to zoom, or double-click the chart to reset")
     }
 
     private var shortPaceTitle: String {
@@ -5669,17 +7979,160 @@ struct UsageChartPopover: View {
         }.count
     }
 
+    @ViewBuilder
+    private func intelligenceStrip(_ intelligence: UsageIntelligenceSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .center, spacing: 14) {
+                ZStack {
+                    Circle()
+                        .stroke(palette.rule, lineWidth: 5)
+                    Circle()
+                        .trim(from: 0, to: min(1, max(0.08, intelligence.pricingCoverage)))
+                        .stroke(palette.pace, style: StrokeStyle(lineWidth: 5, dash: [3, 2]))
+                        .rotationEffect(.degrees(-90))
+                    Text("$")
+                        .font(.system(size: 19, weight: .medium, design: palette.numberDesign))
+                        .foregroundStyle(palette.primary)
+                }
+                .frame(width: 44, height: 44)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("API VALUE")
+                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .tracking(0.8)
+                        .foregroundStyle(palette.pace.opacity(0.86))
+                    Text(String(format: "$%.2f%@", intelligence.apiEquivalentUSD, intelligence.backfillComplete ? "" : "+"))
+                        .font(.system(size: 24, weight: .medium, design: palette.numberDesign))
+                        .monospacedDigit()
+                        .foregroundStyle(palette.primary.opacity(0.94))
+                }
+
+                Spacer(minLength: 4)
+                intelligenceMetric("TOKENS", compactTokens(intelligence.tokens.total))
+                intelligenceMetric("CACHE", percent(cacheShare(intelligence)))
+                intelligenceMetric("FAST", percent(intelligence.fastShare))
+
+                Button { showingIntelligence = true } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(palette.tertiary)
+                        .frame(width: 26, height: 26)
+                        .background(Circle().fill(palette.raisedSurface))
+                }
+                .buttonStyle(.plain)
+                .help("Usage details and data controls")
+                .popover(isPresented: $showingIntelligence, arrowEdge: .top) {
+                    UsageIntelligencePanel(
+                        snapshot: intelligence,
+                        secondaryQuota: secondaryQuota,
+                        onRebuild: onRebuildIntelligence,
+                        onPurge: onPurgeUsageData
+                    )
+                }
+            }
+
+            HStack(spacing: 8) {
+                if let model = intelligence.modelSummaries.first {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(palette.pace.opacity(0.8))
+                    Text(readableModel(model.model))
+                    Text("\(percent(modelShare(model, intelligence))) · \(String(format: "$%.0f", model.apiEquivalentUSD))")
+                        .foregroundStyle(palette.secondary)
+                }
+                if let secondaryQuota {
+                    Spacer()
+                    Text("SHORT \(Int(secondaryQuota.usedPercent.rounded()))%")
+                    Text(relativeReset(secondaryQuota.resetAt))
+                        .foregroundStyle(palette.tertiary)
+                }
+            }
+            .font(.system(size: 8, weight: .bold, design: .monospaced))
+            .foregroundStyle(palette.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(palette.surface)
+                .overlay(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(palette.pace.opacity(0.86))
+                        .frame(width: 2)
+                        .padding(.vertical, 8)
+                }
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("API equivalent \(String(format: "$%.2f", intelligence.apiEquivalentUSD)), \(percent(cacheShare(intelligence))) cache hit, \(percent(intelligence.fastShare)) fast mode")
+    }
+
+    private func intelligenceMetric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text(label)
+                .font(.system(size: 7, weight: .bold, design: .monospaced))
+                .foregroundStyle(palette.tertiary)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(palette.primary.opacity(0.84))
+        }
+    }
+
+    private func cacheShare(_ intelligence: UsageIntelligenceSnapshot) -> Double {
+        let input = intelligence.tokens.uncachedInput
+            + intelligence.tokens.cachedInput
+            + intelligence.tokens.cacheWriteInput
+        guard input > 0 else { return 0 }
+        return Double(intelligence.tokens.cachedInput) / Double(input)
+    }
+
+    private func modelShare(_ model: UsageModelSummary, _ intelligence: UsageIntelligenceSnapshot) -> Double {
+        guard intelligence.tokens.total > 0 else { return 0 }
+        return Double(model.tokens) / Double(intelligence.tokens.total)
+    }
+
+    private func percent(_ value: Double) -> String {
+        "\(Int((max(0, min(1, value)) * 100).rounded()))%"
+    }
+
+    private func compactTokens(_ tokens: Int64) -> String {
+        let value = Double(max(0, tokens))
+        if value >= 1_000_000_000 { return String(format: "%.2fB", value / 1_000_000_000) }
+        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+        if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+        return "\(tokens)"
+    }
+
+    private func readableModel(_ model: String) -> String {
+        model
+            .replacingOccurrences(of: "gpt-", with: "GPT ")
+            .replacingOccurrences(of: "-", with: " ")
+            .uppercased()
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let minutes = max(0, Int(date.timeIntervalSinceNow / 60))
+        if minutes >= 1_440 { return "\(minutes / 1_440)D" }
+        if minutes >= 60 { return "\(minutes / 60)H" }
+        return "\(minutes)M"
+    }
+
     private func paceMetric(_ label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .center, spacing: 4) {
             Text(label)
                 .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.3))
+                .foregroundStyle(palette.tertiary)
             Text(value)
                 .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.82))
+                .foregroundStyle(palette.primary.opacity(0.88))
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 4)
+        // The two insight buttons have fixed widths. Let these three metrics
+        // divide every remaining point evenly so the row has matching left
+        // and right breathing room instead of bunching beside History.
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 9)
     }
 
     private func formatTokens(_ tokens: Int64) -> String {
@@ -5704,7 +8157,7 @@ struct UsageChartPopover: View {
                 }
             Text(label)
                 .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.48))
+                .foregroundStyle(palette.tertiary)
         }
     }
 }
@@ -5716,46 +8169,57 @@ private struct UsageHoverPoint: Equatable {
     let tokens: Int64
     let tokenLabel: String
     let sourceLabel: String
+    let apiEquivalentUSD: Double?
     let isCurrent: Bool
 }
 
 private struct UsageHoverReadout: View {
     let point: UsageHoverPoint?
+    let theme: WidgetTheme
+
+    private var palette: PopoverPalette { theme.popoverPalette }
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(point.map { $0.isCurrent ? "CURRENT WINDOW" : dateLabel($0.date) } ?? "HOVER FOR DAILY DETAIL")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.48))
+                    .foregroundStyle(palette.tertiary)
                 Text(point.map { $0.sourceLabel } ?? "Move across the chart · saved every \(UsageHistoryStore.sampleIntervalDescription())")
                     .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(Color.white.opacity(0.72))
+                    .foregroundStyle(palette.secondary)
             }
 
             Spacer(minLength: 4)
 
             if let point {
                 HStack(spacing: 10) {
-                    metric(label: "USED", value: "\(Int(point.actualPercent.rounded()))%", color: Color(hex: 0x7EE6AE))
-                    metric(label: "IDEAL", value: "\(Int(point.idealPercent.rounded()))%", color: Color.white.opacity(0.72))
+                    metric(label: "USED", value: "\(Int(point.actualPercent.rounded()))%", color: palette.pace)
+                    metric(label: "IDEAL", value: "\(Int(point.idealPercent.rounded()))%", color: palette.secondary)
                     metric(
                         label: point.tokenLabel,
                         value: formatTokens(point.tokens),
-                        color: Color(hex: 0x58B9F3)
+                        color: palette.reset
                     )
+                    if let apiEquivalentUSD = point.apiEquivalentUSD {
+                        metric(
+                            label: "API",
+                            value: String(format: "$%.2f", apiEquivalentUSD),
+                            color: palette.reset
+                        )
+                    }
                 }
             } else {
                 Image(systemName: "cursorarrow.rays")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color.white.opacity(0.32))
+                    .foregroundStyle(palette.tertiary)
             }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(Color.white.opacity(0.045))
+                .fill(palette.surface)
         )
     }
 
@@ -5764,7 +8228,7 @@ private struct UsageHoverReadout: View {
         VStack(alignment: .trailing, spacing: 2) {
             Text(label)
                 .font(.system(size: 7, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.36))
+                .foregroundStyle(palette.tertiary)
             Text(value)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .monospacedDigit()
@@ -5789,6 +8253,228 @@ private struct UsageHoverReadout: View {
             return String(format: "%.1fK", value / 1_000)
         }
         return "\(Int(value))"
+    }
+}
+
+private struct CodexAllowancePanel: View {
+    let windows: [CodexQuotaWindow]
+    let credits: CodexCreditSummary?
+    let resetCredits: [CodexResetCredit]
+    let tasks: [CodexTaskSnapshot]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack {
+                Label("Codex allowances", systemImage: "gauge.with.dots.needle.67percent")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                Spacer()
+                if let credits {
+                    Text(credits.unlimited ? "UNLIMITED" : credits.balance.map { "\($0) CREDITS" } ?? (credits.hasCredits ? "CREDITS" : "NO CREDITS"))
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.44))
+                }
+            }
+
+            if windows.isEmpty {
+                Text("Codex returned only the general allowance this refresh.")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.5))
+            } else {
+                ForEach(windows) { window in
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(window.label.uppercased())
+                                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                Text(window.scope + " · resets " + relative(window.resetAt))
+                                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color.white.opacity(0.42))
+                            }
+                            Spacer()
+                            Text("\(Int(window.usedPercent.rounded()))%")
+                                .font(.system(size: 17, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                        }
+                        GeometryReader { geometry in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.white.opacity(0.07))
+                                Capsule().fill(Color(hex: 0x7EE6AE))
+                                    .frame(width: geometry.size.width * max(0, min(1, window.usedPercent / 100)))
+                            }
+                        }
+                        .frame(height: 5)
+                    }
+                }
+            }
+
+            if !resetCredits.isEmpty {
+                Divider().overlay(Color.white.opacity(0.08))
+                ForEach(resetCredits.prefix(3)) { credit in
+                    HStack(spacing: 9) {
+                        Image(systemName: "arrow.counterclockwise.circle.fill")
+                            .foregroundStyle(Color(hex: 0x58B9F3))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text((credit.description ?? credit.resetType).uppercased())
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            Text(credit.expiresAt.map { "Expires " + relative($0) } ?? credit.status)
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .foregroundStyle(Color.white.opacity(0.42))
+                        }
+                        Spacer()
+                        Text(credit.status.uppercased())
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundStyle(Color(hex: 0x58B9F3))
+                    }
+                }
+            }
+
+            if !tasks.isEmpty {
+                Divider().overlay(Color.white.opacity(0.08))
+                Text("LIVE TASKS")
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .tracking(1)
+                    .foregroundStyle(Color.white.opacity(0.34))
+                ForEach(tasks.prefix(4)) { task in
+                    HStack(spacing: 9) {
+                        Circle().fill(Color(hex: 0x7EE6AE)).frame(width: 6, height: 6)
+                        Text(task.name).lineLimit(1)
+                        Spacer()
+                        Text(task.state.replacingOccurrences(of: "camelCase", with: " ").uppercased())
+                            .foregroundStyle(Color.white.opacity(0.42))
+                    }
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                }
+            }
+        }
+        .padding(18)
+        .frame(width: 360)
+        .background(RoundedRectangle(cornerRadius: 18).fill(Color(hex: 0x101419)))
+        .preferredColorScheme(.dark)
+    }
+
+    private func relative(_ date: Date) -> String {
+        if date <= Date() { return "now" }
+        return RelativeDateTimeFormatter().localizedString(for: date, relativeTo: Date())
+    }
+}
+
+private struct UsageHistoryOverview: View {
+    private struct DayBurn: Identifiable {
+        let date: Date
+        let percent: Double
+        var id: Date { date }
+    }
+
+    let currentHistory: [UsageCheckpoint]
+    let currentWindowStart: Date?
+    let archives: [WeeklyUsageArchive]
+
+    private var burns: [DayBurn] {
+        var result: [DayBurn] = []
+        for archive in archives {
+            let values = [(archive.windowStart, 0.0)] + archive.points.map { ($0.date, $0.usedPercent) }
+            result.append(contentsOf: daily(values))
+        }
+        if let currentWindowStart {
+            let values = [(currentWindowStart, 0.0)] + currentHistory
+                .filter { abs($0.windowStart.timeIntervalSince(currentWindowStart)) < UsageHistoryStore.windowTolerance }
+                .map { ($0.recordedAt, $0.usedPercent) }
+            result.append(contentsOf: daily(values))
+        }
+        var byDate: [Date: Double] = [:]
+        for burn in result { byDate[burn.date] = max(byDate[burn.date] ?? 0, burn.percent) }
+        return byDate.map(DayBurn.init).sorted { $0.date < $1.date }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .bottom) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("USAGE RHYTHM")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .tracking(1.1)
+                        .foregroundStyle(Color.white.opacity(0.36))
+                    Text("Last 26 weeks")
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(peak.map { "\(Int($0.percent.rounded()))%" } ?? "—")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color(hex: 0x7EE6AE))
+                    Text("PEAK DAY")
+                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.34))
+                }
+            }
+
+            Canvas { context, size in
+                let calendar = Calendar.current
+                let end = calendar.startOfDay(for: Date())
+                let start = calendar.date(byAdding: .day, value: -(26 * 7 - 1), to: end) ?? end
+                let cell = min(13, (size.width - 25 * 4) / 26)
+                let gap: CGFloat = 4
+                let lookup = Dictionary(uniqueKeysWithValues: burns.map { (calendar.startOfDay(for: $0.date), $0.percent) })
+                let maxBurn = max(1, burns.map(\.percent).max() ?? 1)
+                for offset in 0..<(26 * 7) {
+                    guard let date = calendar.date(byAdding: .day, value: offset, to: start) else { continue }
+                    let weekday = calendar.component(.weekday, from: date)
+                    let row = (weekday + 5) % 7
+                    let column = offset / 7
+                    let intensity = min(1, (lookup[date] ?? 0) / maxBurn)
+                    let rect = CGRect(x: CGFloat(column) * (cell + gap), y: CGFloat(row) * (cell + gap), width: cell, height: cell)
+                    let color = intensity > 0 ? Color(hex: 0x7EE6AE).opacity(0.18 + intensity * 0.82) : Color.white.opacity(0.045)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 2.5), with: .color(color))
+                }
+            }
+            .frame(height: 7 * 17)
+
+            HStack(spacing: 0) {
+                historyMetric("ACTIVE DAYS", "\(burns.filter { $0.percent > 0.05 }.count)")
+                historyMetric("STREAK", "\(currentStreak)d")
+                historyMetric("WEEKS SAVED", "\(archives.count)")
+            }
+        }
+        .padding(18)
+        .frame(width: 430)
+        .background(RoundedRectangle(cornerRadius: 18).fill(Color(hex: 0x101419)))
+        .preferredColorScheme(.dark)
+    }
+
+    private var peak: DayBurn? { burns.max { $0.percent < $1.percent } }
+
+    private var currentStreak: Int {
+        let calendar = Calendar.current
+        let active = Set(burns.filter { $0.percent > 0.05 }.map { calendar.startOfDay(for: $0.date) })
+        var day = calendar.startOfDay(for: Date())
+        if !active.contains(day), let yesterday = calendar.date(byAdding: .day, value: -1, to: day), active.contains(yesterday) { day = yesterday }
+        var count = 0
+        while active.contains(day) {
+            count += 1
+            guard let previous = calendar.date(byAdding: .day, value: -1, to: day) else { break }
+            day = previous
+        }
+        return count
+    }
+
+    private func daily(_ values: [(Date, Double)]) -> [DayBurn] {
+        let calendar = Calendar.current
+        let sorted = values.sorted { $0.0 < $1.0 }
+        var first: [Date: Double] = [:], last: [Date: Double] = [:]
+        for (date, percent) in sorted {
+            let day = calendar.startOfDay(for: date)
+            if first[day] == nil { first[day] = percent }
+            last[day] = percent
+        }
+        return last.map { day, value in DayBurn(date: day, percent: max(0, value - (first[day] ?? value))) }
+    }
+
+    private func historyMetric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.system(size: 7, weight: .bold, design: .monospaced)).foregroundStyle(Color.white.opacity(0.34))
+            Text(value).font(.system(size: 15, weight: .semibold, design: .rounded)).foregroundStyle(Color.white.opacity(0.86))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -5862,8 +8548,12 @@ private struct UsageChart: View {
     let usedPercent: Double?
     let windowStartDate: Date?
     let resetAt: Date?
+    let usageIntelligence: UsageIntelligenceSnapshot?
+    let theme: WidgetTheme
     @Binding var range: UsageChartRange
     @Binding var hoveredPoint: UsageHoverPoint?
+
+    private var palette: PopoverPalette { theme.popoverPalette }
 
     var body: some View {
         GeometryReader { geometry in
@@ -5916,7 +8606,13 @@ private struct UsageChart: View {
         )
         let idealStart = idealFraction(at: domain.start, windowStart: start, duration: totalDuration)
         let idealEnd = idealFraction(at: domain.end, windowStart: start, duration: totalDuration)
-        let yDomain = verticalDomain(samples: samples, idealStart: idealStart, idealEnd: idealEnd)
+        let costSamples = visibleCostSamples(from: domain.start, through: domain.end)
+        let yDomain = verticalDomain(
+            samples: samples,
+            costFractions: costSamples.map(\.fraction),
+            idealStart: idealStart,
+            idealEnd: idealEnd
+        )
 
         for step in 0...4 {
             let fraction = CGFloat(step) / 4
@@ -5928,13 +8624,13 @@ private struct UsageChart: View {
             grid.addLine(to: CGPoint(x: plot.maxX, y: y))
             context.stroke(
                 grid,
-                with: .color(Color.white.opacity(step == 0 ? 0.2 : 0.08)),
+                with: .color(palette.rule.opacity(step == 0 ? 1 : 0.65)),
                 style: StrokeStyle(lineWidth: step == 0 ? 1 : 0.7)
             )
             context.draw(
                 Text("\(Int((value * 100).rounded()))%")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundColor(Color.white.opacity(0.34)),
+                    .foregroundColor(palette.tertiary),
                 at: CGPoint(x: plot.minX - 6, y: y),
                 anchor: .trailing
             )
@@ -5952,9 +8648,30 @@ private struct UsageChart: View {
         }
         context.stroke(
             ideal,
-            with: .color(Color.white.opacity(0.52)),
+            with: .color(palette.secondary.opacity(0.72)),
             style: StrokeStyle(lineWidth: 1.4, dash: [3, 3])
         )
+
+        let costPoints = costSamples.map { sample in
+            point(
+                for: sample.date,
+                value: sample.fraction,
+                start: domain.start,
+                duration: domainDuration,
+                yDomain: yDomain,
+                plot: plot
+            )
+        }
+        if costPoints.count > 1 {
+            var costPath = Path()
+            costPath.move(to: costPoints[0])
+            for point in costPoints.dropFirst() { costPath.addLine(to: point) }
+            context.stroke(
+                costPath,
+                with: .color(palette.reset.opacity(0.72)),
+                style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
+            )
+        }
 
         let baselineSample = samples.first(where: { $0.isBaseline })
         let observedSamples = samples.filter { !$0.isBaseline }
@@ -5983,12 +8700,12 @@ private struct UsageChart: View {
             gap.addLine(to: firstObserved)
             context.stroke(
                 gap,
-                with: .color(Color(hex: 0x7EE6AE).opacity(0.28)),
+                with: .color(palette.pace.opacity(0.28)),
                 style: StrokeStyle(lineWidth: 1.2, dash: [2, 5])
             )
             context.stroke(
                 Path(ellipseIn: CGRect(x: baseline.x - 3, y: baseline.y - 3, width: 6, height: 6)),
-                with: .color(Color(hex: 0x7EE6AE).opacity(0.72)),
+                with: .color(palette.pace.opacity(0.72)),
                 style: StrokeStyle(lineWidth: 1.2)
             )
         }
@@ -6001,7 +8718,7 @@ private struct UsageChart: View {
             }
             context.stroke(
                 actual,
-                with: .color(Color(hex: 0x7EE6AE)),
+                with: .color(palette.pace),
                 style: StrokeStyle(lineWidth: 2.4, lineCap: .round, lineJoin: .round)
             )
         }
@@ -6009,7 +8726,7 @@ private struct UsageChart: View {
         if let current = observedPoints.last {
             context.fill(
                 Path(ellipseIn: CGRect(x: current.x - 3.5, y: current.y - 3.5, width: 7, height: 7)),
-                with: .color(Color(hex: 0x7EE6AE))
+                with: .color(palette.pace)
             )
         }
 
@@ -6024,7 +8741,7 @@ private struct UsageChart: View {
             guide.addLine(to: CGPoint(x: hoverX, y: plot.maxY))
             context.stroke(
                 guide,
-                with: .color(Color(hex: 0x58B9F3).opacity(0.7)),
+                with: .color(palette.reset.opacity(0.7)),
                 style: StrokeStyle(lineWidth: 1, dash: [2, 3])
             )
 
@@ -6032,11 +8749,11 @@ private struct UsageChart: View {
             let idealY = yPosition(hoveredPoint.idealPercent / 100, domain: yDomain, plot: plot)
             context.fill(
                 Path(ellipseIn: CGRect(x: hoverX - 4, y: actualY - 4, width: 8, height: 8)),
-                with: .color(Color(hex: 0x7EE6AE))
+                with: .color(palette.pace)
             )
             context.stroke(
                 Path(ellipseIn: CGRect(x: hoverX - 4, y: idealY - 4, width: 8, height: 8)),
-                with: .color(Color.white.opacity(0.8)),
+                with: .color(palette.secondary),
                 style: StrokeStyle(lineWidth: 1, dash: [2, 2])
             )
         }
@@ -6044,14 +8761,14 @@ private struct UsageChart: View {
         context.draw(
             Text(axisLabel(domain.start))
                 .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .foregroundColor(Color.white.opacity(0.34)),
+                .foregroundColor(palette.tertiary),
             at: CGPoint(x: plot.minX, y: plot.maxY + 12),
             anchor: .leading
         )
         context.draw(
             Text(axisLabel(domain.end))
                 .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .foregroundColor(Color.white.opacity(0.34)),
+                .foregroundColor(palette.tertiary),
             at: CGPoint(x: plot.maxX, y: plot.maxY + 12),
             anchor: .trailing
         )
@@ -6274,6 +8991,7 @@ private struct UsageChart: View {
             tokens: sample.tokens,
             tokenLabel: sample.tokenLabel,
             sourceLabel: sample.sourceLabel,
+            apiEquivalentUSD: nearestCost(to: sample.date)?.apiEquivalentUSD,
             isCurrent: sample.isCurrent
         )
     }
@@ -6337,11 +9055,12 @@ private struct UsageChart: View {
 
     private func verticalDomain(
         samples: [UsageChartSample],
+        costFractions: [Double],
         idealStart: Double,
         idealEnd: Double
     ) -> ClosedRange<Double> {
         guard range != .window else { return 0...1 }
-        let values = samples.map(\.actualFraction) + [idealStart, idealEnd]
+        let values = samples.map(\.actualFraction) + costFractions + [idealStart, idealEnd]
         guard let minimum = values.min(), let maximum = values.max() else { return 0...1 }
         let span = max(0.05, maximum - minimum)
         var lower = floor(max(0, minimum - span * 0.18) * 20) / 20
@@ -6351,6 +9070,32 @@ private struct UsageChart: View {
             upper = min(1, upper + 0.05)
         }
         return lower...max(lower + 0.05, upper)
+    }
+
+    private func visibleCostSamples(from start: Date, through end: Date) -> [(date: Date, fraction: Double)] {
+        guard let intelligence = usageIntelligence,
+              intelligence.apiEquivalentUSD > 0,
+              let usedPercent,
+              usedPercent > 0
+        else { return [] }
+        let currentFraction = min(1, usedPercent / 100)
+        let all = intelligence.costTimeline.map {
+            (
+                date: $0.date,
+                fraction: min(1, max(0, ($0.apiEquivalentUSD / intelligence.apiEquivalentUSD) * currentFraction))
+            )
+        }.sorted { $0.date < $1.date }
+        var visible = all.filter { $0.date >= start && $0.date <= end }
+        if let preceding = all.last(where: { $0.date < start }) {
+            visible.insert((date: start, fraction: preceding.fraction), at: 0)
+        }
+        return visible
+    }
+
+    private func nearestCost(to date: Date) -> UsageCostPoint? {
+        usageIntelligence?.costTimeline.min {
+            abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date))
+        }
     }
 
     private func idealFraction(at date: Date, windowStart: Date, duration: TimeInterval) -> Double {
