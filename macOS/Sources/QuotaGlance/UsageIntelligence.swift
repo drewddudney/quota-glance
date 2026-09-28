@@ -50,6 +50,7 @@ struct UsageModelSummary: Codable, Identifiable, Equatable, Sendable {
     let model: String
     let tokens: Int64
     let apiEquivalentUSD: Double
+    let gpt6CodexCredits: Double?
 
     var id: String { model }
 }
@@ -74,6 +75,7 @@ struct UsageIntelligenceSnapshot: Codable, Equatable, Sendable {
     let tokens: UsageTokenBreakdown
     let apiEquivalentUSD: Double
     let quotaWeightedUSD: Double
+    let gpt6CodexCredits: Double?
     let pricingCoverage: Double
     let speedCoverage: Double
     let fastShare: Double
@@ -100,6 +102,7 @@ struct UsageIntelligenceSnapshot: Codable, Equatable, Sendable {
             tokens: UsageTokenBreakdown(),
             apiEquivalentUSD: 0,
             quotaWeightedUSD: 0,
+            gpt6CodexCredits: nil,
             pricingCoverage: 0,
             speedCoverage: 0,
             fastShare: 0,
@@ -139,10 +142,47 @@ struct UsagePriceCard: Equatable, Sendable {
     }
 }
 
+struct GPT6CodexCreditRate: Sendable {
+    let inputPerMillion: Double
+    let cachedInputPerMillion: Double
+    let outputPerMillion: Double
+}
+
+enum GPT6CodexCreditCatalog {
+    // Standard-speed Codex credits per million tokens. Codex does not charge a
+    // separate cache-write rate, so cache-write input uses the normal input rate.
+    static let rates: [String: GPT6CodexCreditRate] = [
+        "gpt-6-astra": .init(inputPerMillion: 250, cachedInputPerMillion: 25, outputPerMillion: 1_250),
+        "gpt-6-sol": .init(inputPerMillion: 50, cachedInputPerMillion: 5, outputPerMillion: 250),
+        "gpt-6-luna": .init(inputPerMillion: 2.5, cachedInputPerMillion: 0.25, outputPerMillion: 12.5)
+    ]
+    static let fastMultiplier = 2.5
+
+    static func normalizedModel(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let value = raw.lowercased()
+        for model in rates.keys where value == model || value == "\(model)-wm" {
+            return model
+        }
+        return nil
+    }
+
+    static func credits(tokens: UsageTokenBreakdown, model rawModel: String?, speed: UsageSpeedMode) -> Double? {
+        guard let model = normalizedModel(rawModel), let rate = rates[model] else { return nil }
+        let uncachedAndWritten = tokens.uncachedInput + tokens.cacheWriteInput
+        let input = Double(uncachedAndWritten) * rate.inputPerMillion
+            + Double(tokens.cachedInput) * rate.cachedInputPerMillion
+        let output = Double(tokens.outputText + tokens.reasoningOutput) * rate.outputPerMillion
+        let standardCredits = (input + output) / 1_000_000
+        return speed == .fast ? standardCredits * fastMultiplier : standardCredits
+    }
+}
+
 enum UsagePriceCatalog {
-    static let version = "openai-api-prices-reviewed-2026-09-04-v2"
+    static let version = "openai-api-and-codex-rates-reviewed-2026-09-22-v3"
     static let sourceURL = "https://developers.openai.com/api/docs/pricing"
-    static let reviewedAt = ISO8601DateFormatter().date(from: "2026-09-04T23:10:00Z")!
+    static let codexSourceURL = "https://developers.openai.com/codex/pricing"
+    static let reviewedAt = ISO8601DateFormatter().date(from: "2026-09-22T00:00:00Z")!
     static let longContextBoundary = 272_000
 
     private static let formatter: DateFormatter = {
@@ -181,6 +221,9 @@ enum UsagePriceCatalog {
         guard let raw else { return nil }
         let value = raw.lowercased()
         if value == "gpt-5.6-sol-wm" { return "gpt-5.6-sol" }
+        if value == "gpt-6-astra-wm" { return "gpt-6-astra" }
+        if value == "gpt-6-sol-wm" { return "gpt-6-sol" }
+        if value == "gpt-6-luna-wm" { return "gpt-6-luna" }
         if value == "gpt-5.5-codex" { return "gpt-5.5" }
         if value == "codex-auto-review" { return "gpt-5.4" }
         return value
@@ -241,6 +284,7 @@ private struct UsageLedgerEvent: Codable, Sendable {
     let tokens: UsageTokenBreakdown
     let apiEquivalentUSD: Double?
     let quotaWeightedUSD: Double?
+    let gpt6CodexCredits: Double?
     let pricedTokens: Int64
 }
 
@@ -465,6 +509,7 @@ enum UsageIntelligenceStore {
             tokens: event.tokens,
             apiEquivalentUSD: price.usd,
             quotaWeightedUSD: weighted,
+            gpt6CodexCredits: GPT6CodexCreditCatalog.credits(tokens: event.tokens, model: event.model, speed: event.speed),
             pricedTokens: price.pricedTokens
         )
     }
@@ -683,6 +728,7 @@ enum UsageIntelligenceStore {
                 tokens: tokens,
                 apiEquivalentUSD: price.usd,
                 quotaWeightedUSD: weighted,
+                gpt6CodexCredits: GPT6CodexCreditCatalog.credits(tokens: tokens, model: cursor.model, speed: effectiveSpeed),
                 pricedTokens: price.pricedTokens
             )
         )
@@ -747,17 +793,37 @@ enum UsageIntelligenceStore {
             now: now
         )
 
-        var modelBuckets: [String: (tokens: Int64, usd: Double)] = [:]
+        let gpt6Credits = events.compactMap(\.gpt6CodexCredits).reduce(0, +)
+        var modelBuckets: [String: (tokens: Int64, usd: Double, credits: Double)] = [:]
         for event in events {
             let model = event.model ?? "Unknown model"
-            var bucket = modelBuckets[model] ?? (0, 0)
+            var bucket = modelBuckets[model] ?? (0, 0, 0)
             bucket.tokens += event.tokens.total
             bucket.usd += event.apiEquivalentUSD ?? 0
+            bucket.credits += event.gpt6CodexCredits ?? 0
             modelBuckets[model] = bucket
         }
-        let models = modelBuckets.map {
-            UsageModelSummary(model: $0.key, tokens: $0.value.tokens, apiEquivalentUSD: $0.value.usd)
-        }.sorted { $0.apiEquivalentUSD > $1.apiEquivalentUSD }
+        var modelSummaries: [UsageModelSummary] = []
+        for (model, bucket) in modelBuckets {
+            let codexCredits: Double?
+            if GPT6CodexCreditCatalog.normalizedModel(model) != nil {
+                codexCredits = bucket.credits
+            } else {
+                codexCredits = nil
+            }
+            modelSummaries.append(UsageModelSummary(
+                model: model,
+                tokens: bucket.tokens,
+                apiEquivalentUSD: bucket.usd,
+                gpt6CodexCredits: codexCredits
+            ))
+        }
+        let models = modelSummaries.sorted { lhs, rhs in
+            if lhs.tokens == rhs.tokens {
+                return lhs.apiEquivalentUSD > rhs.apiEquivalentUSD
+            }
+            return lhs.tokens > rhs.tokens
+        }
 
         let calendar = Calendar(identifier: .gregorian)
         var cumulativeAPI = 0.0
@@ -791,6 +857,7 @@ enum UsageIntelligenceStore {
             tokens: totalTokens,
             apiEquivalentUSD: apiTotal,
             quotaWeightedUSD: weightedTotal,
+            gpt6CodexCredits: events.contains(where: { $0.gpt6CodexCredits != nil }) ? gpt6Credits : nil,
             pricingCoverage: min(1, Double(pricedTokens) / Double(rawTokenCount)),
             speedCoverage: min(1, Double(knownSpeedTokens) / Double(rawTokenCount)),
             fastShare: Double(fastTokens) / Double(rawTokenCount),
@@ -874,6 +941,21 @@ struct UsageIntelligencePanel: View {
                     .foregroundStyle(Color(hex: 0x7EE6AE))
             }
 
+            if let credits = snapshot.gpt6CodexCredits {
+                HStack {
+                    Text("GPT-6 CODEX CREDITS · STANDARD RATE CARD")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.35))
+                    Spacer()
+                    Text(String(format: "%.2f cr", credits))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Color(hex: 0x7EE6AE))
+                }
+                Text("Sol and Luna have Codex credit estimates; no public API dollar rate is listed yet.")
+                    .font(.system(size: 8, weight: .regular, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.35))
+            }
+
             HStack(spacing: 8) {
                 metric("CACHE", percent(cacheShare))
                 metric("PRICED", percent(snapshot.pricingCoverage))
@@ -897,8 +979,13 @@ struct UsageIntelligencePanel: View {
                             Text(model.model)
                             Spacer()
                             Text(shortTokens(model.tokens))
-                            Text(currency(model.apiEquivalentUSD))
+                            Text(model.apiEquivalentUSD > 0 || model.gpt6CodexCredits == nil
+                                 ? currency(model.apiEquivalentUSD) : "API —")
                                 .frame(width: 54, alignment: .trailing)
+                            if let credits = model.gpt6CodexCredits {
+                                Text(String(format: "%.2f cr", credits))
+                                    .frame(width: 62, alignment: .trailing)
+                            }
                         }
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(Color.white.opacity(0.62))

@@ -6,6 +6,8 @@
 DerivedData/
 .xcode-derived/
 .device-derived/
+.device-*/
+.sim-*/
 *.xcarchive
 *.ipa
 *.dSYM
@@ -15,6 +17,7 @@ DerivedData/
 *.xcodeproj/
 xcuserdata/
 *.xcuserstate
+*.orig
 
 # Signing material and local configuration
 *.mobileprovision
@@ -22,6 +25,9 @@ xcuserdata/
 *.p12
 *.cer
 *.key
+*.p8
+*.pem
+*.pfx
 Config.local.xcconfig
 
 # Local credentials, logs, caches, and exports

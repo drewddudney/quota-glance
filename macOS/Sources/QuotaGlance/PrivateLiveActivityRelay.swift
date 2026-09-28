@@ -42,7 +42,7 @@ enum PrivateLiveActivitySettings {
 }
 
 enum PrivateAPNsKeychain {
-    private static let service = "com.drewdudney.quotaglance.private-apns"
+    private static let service = "com.example.quotaglance.private-apns"
     private static let account = "live-activity-signing-key"
 
     static func save(_ pem: String) throws {
@@ -114,8 +114,8 @@ actor PrivateLiveActivityRelay {
 
     private static let registrationKey = "QuotaGlance.liveActivity.codex.registration.v1"
     private static let pushToStartKey = "QuotaGlance.liveActivity.codex.pushToStart.v1"
-    private static let topic = "com.drewdudney.quotaglance.mobile.push-type.liveactivity"
-    private static let logger = Logger(subsystem: "com.drewdudney.quotaglance", category: "PrivateLiveFeed")
+    private static let topic = "com.example.quotaglance.mobile.push-type.liveactivity"
+    private static let logger = Logger(subsystem: "com.example.quotaglance", category: "PrivateLiveFeed")
     private var cachedJWT: (value: String, createdAt: Date)?
     private var lastSentFingerprint: String?
     private var projectionTask: Task<Void, Never>?

@@ -1,4 +1,6 @@
 import AppKit
+import Charts
+import Combine
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -7,63 +9,14 @@ import WebKit
 @main
 struct QuotaGlanceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var model = DashboardModel()
-
     var body: some Scene {
-        WindowGroup {
-            DashboardView(model: model)
-                .frame(
-                    minWidth: 128,
-                    idealWidth: 680,
-                    maxWidth: .infinity,
-                    minHeight: 128,
-                    idealHeight: 230,
-                    maxHeight: .infinity
-                )
-                .background(WindowConfigurator())
-                .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceRefresh)) { _ in
-                    model.refresh()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceResetCalculatorChanged)) { notification in
-                    if let rawValues = notification.object as? [String] {
-                        model.selectForecastSources(rawValues)
-                    }
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceBillingUpdated)) { _ in
-                    model.publishMobileSnapshot()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceMenuInteraction)) { _ in
-                    model.noteMenuInteraction()
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .quotaGlancePrivateLiveFeedTest)) { _ in
-                    model.publishMobileSnapshot()
-                }
-                .onReceive(
-                    NotificationCenter.default.publisher(
-                        for: NSUbiquitousKeyValueStore.didChangeExternallyNotification
-                    )
-                ) { notification in
-                    let keys = notification.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
-                    if keys == nil || keys?.contains(ResetApplicability.cloudKey) == true {
-                        model.syncResetApplicabilityFromCloud()
-                    }
-                }
-                .alert(
-                    "Does this reset apply to your account?",
-                    isPresented: Binding(
-                        get: { model.resetApplicabilityQuestion != nil },
-                        set: { _ in }
-                    )
-                ) {
-                    Button("Yes, it applies") { model.answerResetApplicability(true) }
-                    Button("No, not eligible") { model.answerResetApplicability(false) }
-                } message: {
-                    Text(model.resetApplicabilityQuestion?.text ?? "This reset has account-specific eligibility requirements.")
-                }
-        }
-        .defaultSize(width: 680, height: 230)
+        Settings { EmptyView() }
         .commands {
             CommandGroup(replacing: .newItem) { }
+            CommandGroup(replacing: .appSettings) {
+                Button("Layout…") { ProviderDisplayController.shared.showSettings() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 }
@@ -79,6 +32,8 @@ extension Notification.Name {
     static let quotaGlanceMenuBarSummaryChanged = Notification.Name("QuotaGlance.menuBarSummaryChanged")
     static let quotaGlanceShowTweets = Notification.Name("QuotaGlance.showTweets")
     static let quotaGlancePrivateLiveFeedTest = Notification.Name("QuotaGlance.privateLiveFeedTest")
+    static let quotaGlanceProvidersChanged = Notification.Name("QuotaGlance.providersChanged")
+    static let quotaGlanceOpenCodexResetCalculator = Notification.Name("QuotaGlance.openCodexResetCalculator")
 }
 
 enum DockPosition: String, CaseIterable, Sendable {
@@ -809,7 +764,7 @@ enum ForecastSource: String, CaseIterable, Identifiable, Sendable {
         case .willCodexQuotaReset: return URL(string: "https://www.willcodexquotareset.com")
         case .gussuri: return URL(string: "https://codex.gussuriworks.com/en")
         case .polymarket:
-            return URL(string: "https://polymarket.com/event/openai-resets-codex-weekly-usage-limit-byptptpt-20260901192000000")
+            return URL(string: UserDefaults.standard.string(forKey: "QuotaGlance.polymarketEventURL") ?? "https://polymarket.com")
         case .average: return nil
         }
     }
@@ -950,9 +905,14 @@ private final class ResetCalculatorMenuView: NSView {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
+    private let claudeBar = ClaudeBarController.shared
+    private let providerDisplay = ProviderDisplayController.shared
     private let statusPopover = NSPopover()
     private var statusClockTimer: Timer?
+    private var runtime: ProviderAppRuntime?
+    private var claudeStatusObservation: AnyCancellable?
     private var shouldExitForExistingInstance = false
+    private var calculatorWindow: NSWindow?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         guard let identifier = Bundle.main.bundleIdentifier else { return }
@@ -988,7 +948,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.action = #selector(handleStatusItemClick)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem = item
+        runtime = ProviderAppRuntime()
         configureStatusPopover()
+        NotificationCenter.default.addObserver(self, selector: #selector(menuBarSummaryChanged), name: .quotaGlanceProvidersChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(showCodexResetCalculator), name: .quotaGlanceOpenCodexResetCalculator, object: nil)
+        claudeStatusObservation = claudeBar.model.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { self?.updateStatusItem() }
+        }
         updateStatusItem()
         NotificationCenter.default.addObserver(
             self,
@@ -1000,18 +966,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.updateStatusItem() }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.enableLaunchAtLoginIfNeeded()
-            // SwiftUI can restore the borderless window to a stale Space or
-            // an off-screen frame after a restart. Bring it back to a known,
-            // glanceable position whenever the app is launched.
-            self?.revealDashboard(attempt: 0)
+        DispatchQueue.main.async { [weak self] in
+            self?.providerDisplay.restore()
             BillingSyncCoordinator.runAutomaticSyncIfNeeded()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         statusClockTimer?.invalidate()
+        claudeBar.stop()
+        providerDisplay.stop()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -1027,25 +991,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureStatusPopover() {
         statusPopover.behavior = .transient
         statusPopover.animates = true
-        statusPopover.contentSize = NSSize(width: 386, height: 430)
         statusPopover.contentViewController = NSHostingController(
-            rootView: MenuBarSummaryPopover(
-                summary: .shared,
-                onOpenWidget: { [weak self] in
+            rootView: ProviderStatusPopover(controller: providerDisplay, codex: .shared, claude: claudeBar.model,
+                onVisibility: { [weak self] in
                     self?.statusPopover.performClose(nil)
-                    self?.toggleDashboardVisibility(forceShow: true)
-                },
-                onOpenTweets: { [weak self] in
+                    self?.providerDisplay.toggleVisibility()
+                }, onLayout: { [weak self] in
                     self?.statusPopover.performClose(nil)
-                    self?.toggleDashboardVisibility(forceShow: true)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        NotificationCenter.default.post(name: .quotaGlanceShowTweets, object: nil)
-                    }
-                },
-                onRefresh: {
-                    NotificationCenter.default.post(name: .quotaGlanceRefresh, object: nil)
-                }
-            )
+                    self?.providerDisplay.showSettings()
+                })
         )
     }
 
@@ -1065,167 +1019,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem() {
         guard let button = statusItem?.button else { return }
-        let mode = MenuBarDisplayMode(
-            rawValue: UserDefaults.standard.string(forKey: MenuBarDisplayMode.defaultsKey) ?? ""
-        ) ?? .smart
-        let summary = MenuBarSummaryModel.shared
-        statusPopover.contentSize = NSSize(
-            width: 386,
-            height: summary.shortWindow == nil ? 378 : 470
-        )
-        let title = summary.statusText(mode: mode)
-        let result = NSMutableAttributedString(
-            string: title,
-            attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: NSColor.labelColor
-            ]
-        )
-        if summary.payload.unreadTweet {
-            result.append(NSAttributedString(
-                string: " •",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: NSColor.systemBlue
-                ]
-            ))
-        }
-        if summary.freshness != .live, mode != .iconOnly {
-            result.append(NSAttributedString(
-                string: " !",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 10, weight: .bold),
-                    .foregroundColor: summary.freshness == .offline ? NSColor.systemRed : NSColor.systemOrange
-                ]
-            ))
+        let readings = providerDisplay.selection.filter([
+            ProviderReading.codex(.shared, at: .now), ProviderReading.claude(claudeBar.model, at: .now)
+        ])
+        let title = readings.map { $0.name + " " + ProviderReading.percent($0.usage) }.joined(separator: " · ")
+        let result = NSMutableAttributedString(string: title, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.labelColor
+        ])
+        if providerDisplay.selection.contains(.codex), MenuBarSummaryModel.shared.payload.unreadTweet {
+            result.append(NSAttributedString(string: " •", attributes: [.foregroundColor: NSColor.systemBlue]))
         }
         button.image = nil
         button.attributedTitle = result
-        button.toolTip = "Quota Glance · \(summary.freshness.rawValue.capitalized)"
-        button.setAccessibilityLabel("Quota Glance, \(title), \(summary.freshness.rawValue)")
-    }
-
-    private var dashboardWindow: NSWindow? {
-        NSApp.windows.first { $0.title == "Quota Glance" || $0.contentView != nil }
-    }
-
-    private func show(_ window: NSWindow) {
-        if WindowDockController.shared.position.isMounted {
-            WindowDockController.shared.restoreDock(on: window)
-        } else {
-        // Prefer the display whose Cocoa frame contains the global origin;
-        // that is the stable primary display even when a restored window is
-        // pointing at a monitor that is no longer connected.
-        let primaryScreen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: 0, y: 0)) }
-        if let screen = primaryScreen ?? NSScreen.main ?? window.screen ?? NSScreen.screens.first {
-            let visible = screen.visibleFrame
-            let size = WindowDockController.shared.savedFloatingSize ?? NSSize(width: 680, height: 230)
-            let origin = NSPoint(
-                x: visible.midX - size.width / 2,
-                y: visible.midY - size.height / 2
-            )
-            WindowDockController.shared.setFrame(
-                NSRect(origin: origin, size: size),
-                on: window,
-                animated: false
-            )
-        }
-        }
-        window.orderFrontRegardless()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        button.toolTip = readings.map { $0.name + ": " + $0.status }.joined(separator: "\n")
+        button.setAccessibilityLabel("Quota Glance, " + title)
+        statusPopover.contentSize = NSSize(width: 328, height: readings.count == 1 ? 184 : 258)
     }
 
     private func showMenu() {
         let menu = NSMenu()
-        let dashboardIsVisible = dashboardWindow?.isVisible == true
-        menu.addItem(
-            withTitle: dashboardIsVisible ? "Hide Quota Glance" : "Show Quota Glance",
-            action: #selector(toggleDashboardVisibilityFromMenu),
-            keyEquivalent: ""
-        )
-        menu.addItem(withTitle: "Refresh now", action: #selector(refresh), keyEquivalent: "r")
-        let loginItem = NSMenuItem(
-            title: "Launch at Login",
-            action: #selector(toggleLaunchAtLogin),
-            keyEquivalent: ""
-        )
-        switch SMAppService.mainApp.status {
-        case .enabled:
-            loginItem.state = .on
-        case .requiresApproval:
-            loginItem.state = .mixed
-        default:
-            loginItem.state = .off
+        menu.addItem(withTitle: providerDisplay.isVisible ? "Hide widget" : "Show widget", action: #selector(toggleDashboardVisibilityFromMenu), keyEquivalent: "")
+        menu.addItem(withTitle: "Layout…", action: #selector(showDisplayOptions), keyEquivalent: ",")
+        menu.addItem(withTitle: "Refresh", action: #selector(refresh), keyEquivalent: "r")
+        menu.addItem(.separator())
+
+        let codexItem = NSMenuItem(title: "Codex", action: nil, keyEquivalent: "")
+        let codexMenu = NSMenu(title: "Codex")
+        codexMenu.addItem(withTitle: "Reset calculator…", action: #selector(showCodexResetCalculator), keyEquivalent: "")
+        codexMenu.addItem(resetActionsMenuItem())
+        codexMenu.items.forEach { $0.target = self }
+        codexItem.submenu = codexMenu
+        if providerDisplay.selection.contains(.codex) { menu.addItem(codexItem) }
+
+        let advancedItem = NSMenuItem(title: "Advanced", action: nil, keyEquivalent: "")
+        let advancedMenu = NSMenu(title: "Advanced")
+        advancedMenu.addItem(privateLiveFeedMenuItem())
+        advancedMenu.addItem(.separator())
+        if providerDisplay.selection.contains(.claude) {
+            advancedMenu.addItem(withTitle: "Claude sign-in…", action: #selector(connectClaude), keyEquivalent: "")
         }
-        menu.addItem(loginItem)
-        let menuBarItem = NSMenuItem(title: "Menu Bar", action: nil, keyEquivalent: "")
-        let menuBarMenu = NSMenu(title: "Menu Bar")
-        let selectedMenuBarMode = MenuBarDisplayMode(
-            rawValue: UserDefaults.standard.string(forKey: MenuBarDisplayMode.defaultsKey) ?? ""
-        ) ?? .smart
-        for mode in MenuBarDisplayMode.allCases {
-            let item = NSMenuItem(
-                title: mode.displayName,
-                action: #selector(selectMenuBarDisplay(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = mode.rawValue
-            item.state = mode == selectedMenuBarMode ? .on : .off
-            menuBarMenu.addItem(item)
-        }
-        menuBarItem.submenu = menuBarMenu
-        menu.addItem(menuBarItem)
-        let themeItem = NSMenuItem(title: "Theme", action: nil, keyEquivalent: "")
-        let themeMenu = NSMenu(title: "Theme")
-        let selectedTheme = WidgetTheme(
-            rawValue: UserDefaults.standard.string(forKey: WidgetTheme.defaultsKey) ?? ""
-        ) ?? .current
-        let themeOrder: [WidgetTheme] = [.current, .marine, .retro, .oled, .radar, .eInk]
-        for theme in themeOrder {
-            let item = NSMenuItem(
-                title: theme.displayName,
-                action: #selector(selectTheme(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = theme.rawValue
-            item.state = theme == selectedTheme ? .on : .off
-            themeMenu.addItem(item)
-        }
-        themeItem.submenu = themeMenu
-        menu.addItem(themeItem)
-        let paceRateItem = NSMenuItem(title: "Pace Rate", action: nil, keyEquivalent: "")
-        let paceRateMenu = NSMenu(title: "Pace Rate")
-        let selectedPaceRate = UsagePaceRate(
-            rawValue: UserDefaults.standard.string(forKey: UsagePaceRate.defaultsKey) ?? ""
-        ) ?? .oneHour
-        for paceRate in UsagePaceRate.allCases {
-            let item = NSMenuItem(
-                title: paceRate.displayName,
-                action: #selector(selectPaceRate(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = paceRate.rawValue
-            item.state = paceRate == selectedPaceRate ? .on : .off
-            paceRateMenu.addItem(item)
-        }
-        paceRateItem.submenu = paceRateMenu
-        menu.addItem(paceRateItem)
-        let resetCalculatorItem = NSMenuItem(title: "Reset Calculator", action: nil, keyEquivalent: "")
-        let resetCalculatorMenu = NSMenu(title: "Reset Calculator")
-        let selectedResetCalculators = ForecastSourceSelection.load()
-        let resetCalculatorPicker = NSMenuItem()
-        resetCalculatorPicker.view = ResetCalculatorMenuView(
-            selectedSources: selectedResetCalculators
-        )
-        resetCalculatorMenu.addItem(resetCalculatorPicker)
-        resetCalculatorItem.submenu = resetCalculatorMenu
-        menu.addItem(resetCalculatorItem)
-        menu.addItem(resetActionsMenuItem())
-        menu.addItem(privateLiveFeedMenuItem())
+        advancedMenu.items.forEach { $0.target = self }
+        advancedItem.submenu = advancedMenu
+        menu.addItem(advancedItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }
@@ -1234,33 +1069,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = nil
     }
 
-    @objc private func toggleDashboardVisibilityFromMenu() {
-        toggleDashboardVisibility(forceShow: false)
-    }
+    @objc private func toggleDashboardVisibilityFromMenu() { providerDisplay.toggleVisibility() }
+    @objc private func connectClaude() { claudeBar.model.connect() }
+    @objc private func showDisplayOptions() { providerDisplay.showSettings() }
 
-    private func toggleDashboardVisibility(forceShow: Bool) {
-        guard let window = dashboardWindow else { return }
-        if window.isVisible && !forceShow {
-            window.orderOut(nil)
-        } else {
-            show(window)
+    @objc private func showCodexResetCalculator() {
+        if calculatorWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 260, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "Codex reset calculator"
+            window.isReleasedWhenClosed = false
+            window.center()
+            calculatorWindow = window
         }
-    }
-
-    private func revealDashboard(attempt: Int) {
-        guard let window = dashboardWindow else {
-            guard attempt < 12 else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.revealDashboard(attempt: attempt + 1)
-            }
-            return
-        }
-        show(window)
+        calculatorWindow?.contentView = ResetCalculatorMenuView(selectedSources: ForecastSourceSelection.load())
+        calculatorWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func refresh() {
         NotificationCenter.default.post(name: .quotaGlanceMenuInteraction, object: nil)
         NotificationCenter.default.post(name: .quotaGlanceRefresh, object: nil)
+        claudeBar.model.refresh()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -1279,33 +1108,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("Quota Glance could not update Launch at Login: %@", error.localizedDescription)
             SMAppService.openSystemSettingsLoginItems()
         }
-    }
-
-    @objc private func selectTheme(_ sender: NSMenuItem) {
-        guard
-            let rawValue = sender.representedObject as? String,
-            WidgetTheme(rawValue: rawValue) != nil
-        else { return }
-        UserDefaults.standard.set(rawValue, forKey: WidgetTheme.defaultsKey)
-        NotificationCenter.default.post(name: .quotaGlanceThemeChanged, object: rawValue)
-    }
-
-    @objc private func selectMenuBarDisplay(_ sender: NSMenuItem) {
-        guard
-            let rawValue = sender.representedObject as? String,
-            MenuBarDisplayMode(rawValue: rawValue) != nil
-        else { return }
-        UserDefaults.standard.set(rawValue, forKey: MenuBarDisplayMode.defaultsKey)
-        updateStatusItem()
-    }
-
-    @objc private func selectPaceRate(_ sender: NSMenuItem) {
-        guard
-            let rawValue = sender.representedObject as? String,
-            UsagePaceRate(rawValue: rawValue) != nil
-        else { return }
-        UserDefaults.standard.set(rawValue, forKey: UsagePaceRate.defaultsKey)
-        NotificationCenter.default.post(name: .quotaGlancePaceRateChanged, object: rawValue)
     }
 
     @objc private func toggleResetCalculator(_ sender: NSMenuItem) {
@@ -1333,11 +1135,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func resetActionsMenuItem() -> NSMenuItem {
-        let root = NSMenuItem(title: "Reset Actions", action: nil, keyEquivalent: "")
+        let root = NSMenuItem(title: "After a Codex reset", action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: "Reset Actions")
 
         let sound = NSMenuItem(
-            title: "Fairy Sound",
+            title: "Reset Sound Effects",
             action: #selector(toggleResetSound),
             keyEquivalent: ""
         )
@@ -1374,7 +1176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         submenu.addItem(.separator())
-        submenu.addItem(withTitle: "Test Sound & Hook", action: #selector(testResetActions), keyEquivalent: "")
+        submenu.addItem(withTitle: "Preview Celebration & Test Hook", action: #selector(testResetActions), keyEquivalent: "")
         submenu.addItem(withTitle: "Send Test Hello Now", action: #selector(testResetClockStarter), keyEquivalent: "")
         submenu.items.forEach { $0.target = self }
         root.submenu = submenu
@@ -1429,7 +1231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .replacingOccurrences(of: "AuthKey_", with: "")
         let keyID = NSTextField(string: PrivateLiveActivitySettings.keyID ?? filenameKeyID)
         keyID.placeholderString = "APNs Key ID"
-        let teamID = NSTextField(string: PrivateLiveActivitySettings.teamID ?? "5DYDN5X5T2")
+        let teamID = NSTextField(string: PrivateLiveActivitySettings.teamID ?? "")
         teamID.placeholderString = "Apple Developer Team ID"
         let labels = NSStackView(views: [
             NSTextField(labelWithString: "Key ID"), keyID,
@@ -1534,7 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func testResetActions() {
         let summary = MenuBarSummaryModel.shared
-        if ResetAutomationSettings.soundEnabled { ResetCompletionSound.play() }
+        ProviderResetCelebrationController.shared.preview(.codex)
         ResetAutomationRunner.dispatch(
             ResetAutomationEvent(
                 event: "quota_reset_test",
@@ -1566,72 +1368,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-struct WindowConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async { configure(view.window) }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async { configure(nsView.window) }
-    }
-
-    private func configure(_ window: NSWindow?) {
-        guard let window else { return }
-        window.title = "Quota Glance"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        // A non-resizable window never enters macOS's edge-tiling preview.
-        // Quota Glance temporarily enables the flag only while its own resize
-        // handle or dock transition is actively changing the frame.
-        window.styleMask = WindowDockController.shared.requiresResizableStyle
-            ? [.borderless, .resizable]
-            : [.borderless]
-        window.level = .floating
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .fullScreenDisallowsTiling]
-        window.tabbingMode = .disallowed
-        // Let AppKit handle moving from the empty widget background. Keeping
-        // this outside SwiftUI's gesture system prevents moves and resizes
-        // from fighting each other.
-        window.isMovableByWindowBackground = true
-        window.isRestorable = false
-        _ = window.setFrameAutosaveName("")
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.hasShadow = true
-        // The widget can collapse into a square three-ring face below the
-        // normal three-dial strip size, so both axes must remain resizable.
-        let minimumSize = NSSize(width: 118, height: 118)
-        let maximumSize = NSSize(width: 1200, height: 1200)
-        window.contentMinSize = minimumSize
-        window.contentMaxSize = maximumSize
-        window.minSize = minimumSize
-        window.maxSize = maximumSize
-
-        if window.frame.width < minimumSize.width || window.frame.height < minimumSize.height {
-            window.setContentSize(minimumSize)
-        }
-        WindowDockController.shared.attach(to: window)
-    }
-}
-
-enum ResetCompletionSound {
-    private static var player: NSSound?
-
-    static func play() {
-        guard let url = Bundle.main.url(forResource: "QuotaResetFairy", withExtension: "caf") else {
-            NSSound(named: .init("Glass"))?.play()
-            return
-        }
-        player = NSSound(contentsOf: url, byReference: true)
-        player?.volume = 0.72
-        player?.play()
-    }
-}
-
 @MainActor
 final class DashboardModel: ObservableObject {
+    var providerRunoutAt: Date? {
+        UsagePace.calculate(usedPercent: usedPercent, windowStartDate: usageWindowStart,
+            resetAt: resetAt, usageHistory: usageHistory, localTokensTotal: localTokensTotal,
+            localTokenPace: localTokenPace, usageIntelligence: usageIntelligence, rate: .oneHour).projectedExhaustion
+    }
+
     @Published var usedPercent: Double?
     @Published var weekElapsedPercent: Double?
     @Published var resetAt: Date?
@@ -1681,6 +1425,8 @@ final class DashboardModel: ObservableObject {
     private let tweetWatermarkKey = "QuotaGlance.observedTiboTweetDate.v2"
     init() {
         NSUbiquitousKeyValueStore.default.synchronize()
+        MenuBarSummaryModel.shared.onClearTweet = { [weak self] in self?.clearNewTweetAlert() }
+        ClaudeBarController.shared.model.onSnapshotChanged = { [weak self] in self?.publishMobileSnapshot() }
         restoreCachedCodexState()
         refresh()
         startAdaptiveUsageRefresh()
@@ -1948,9 +1694,7 @@ final class DashboardModel: ObservableObject {
         )
         let justReset = resetLifecycle.completedAt != nil
             && resetLifecycle.completedAt != previousResetCompletion
-        if justReset && isLive && ResetAutomationSettings.soundEnabled {
-            ResetCompletionSound.play()
-        }
+        // The celebration controller plays the selected scene's synchronized sound.
         if justReset && isLive {
             ResetAutomationRunner.dispatch(
                 ResetAutomationEvent(
@@ -2097,7 +1841,10 @@ final class DashboardModel: ObservableObject {
                 unreadTweet: newTweetAlert != nil,
                 lastSuccessfulAt: lastCodexSuccessfulAt,
                 lastAttemptFailed: lastCodexAttemptFailed,
-                statusMessage: codexStatus
+                statusMessage: codexStatus,
+                calendarDeadlineAt: resetAt,
+                newTweet: newTweetAlert,
+                tweets: resetIntel?.tweets ?? []
             )
         )
     }
@@ -2128,7 +1875,7 @@ final class DashboardModel: ObservableObject {
             return response
         }
         let mobileHistory = mobileUsageHistory(now: Date())
-        let snapshot = MobileQuotaSnapshot(
+        var snapshot = MobileQuotaSnapshot(
             capturedAt: Date(),
             weekElapsedPercent: weekElapsedPercent,
             usagePercent: usedPercent,
@@ -2184,6 +1931,7 @@ final class DashboardModel: ObservableObject {
                 return MobileUsageIntelligence(
                     apiEquivalentUSD: $0.apiEquivalentUSD,
                     quotaWeightedUSD: $0.quotaWeightedUSD,
+                    gpt6CodexCredits: $0.gpt6CodexCredits,
                     pricingCoverage: $0.pricingCoverage,
                     speedCoverage: $0.speedCoverage,
                     fastShare: $0.fastShare,
@@ -2262,6 +2010,8 @@ final class DashboardModel: ObservableObject {
                     )
                 }
         )
+        snapshot.usageUpdatedAt = lastCodexSuccessfulAt ?? .distantPast
+        snapshot.claude = ClaudeBarController.shared.model.mobileSnapshot
         Task { await MobileSnapshotPublisher.shared.schedule(snapshot) }
     }
 
@@ -2891,6 +2641,7 @@ enum CodexService {
 
     private static func fetchSynchronously() throws -> CodexSnapshot {
         let candidates = [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/opt/homebrew/bin/codex",
             "/usr/local/bin/codex"
@@ -3379,18 +3130,24 @@ struct ResetMetric: Identifiable, Sendable {
     let detail: String?
 }
 
-struct PolymarketResetHedge: Sendable, Equatable {
-    static let targetPayout = 80.0
+struct PolymarketResetForecast: Sendable, Equatable {
+    struct Point: Sendable, Equatable, Identifiable {
+        var id: Date { deadline }
+        let marketLabel: String
+        let deadline: Date
+        let yesPrice: Double
+        let noPrice: Double
+        var usesLastTrade: Bool = false
 
-    let marketLabel: String
-    let deadline: Date
-    let yesPrice: Double
-    let noPrice: Double
+        var axisLabel: String {
+            let parts = marketLabel.split(separator: " ", maxSplits: 1)
+            guard parts.count == 2 else { return marketLabel }
+            return "\(parts[0].prefix(3)) \(parts[1])"
+        }
+    }
+
+    let points: [Point]
     let url: URL
-
-    var shares: Double { Self.targetPayout }
-    var stake: Double { shares * noPrice }
-    var grossProfit: Double { Self.targetPayout - stake }
 }
 
 struct ResetProviderSnapshot: Identifiable, Sendable {
@@ -3409,7 +3166,7 @@ struct ResetProviderSnapshot: Identifiable, Sendable {
     /// intentionally separate from an official reset announcement.
     let forecastDeadline: Date?
     let announcement: ResetAnnouncement?
-    let polymarketHedge: PolymarketResetHedge?
+    var polymarketForecast: PolymarketResetForecast? = nil
 }
 
 struct TiboTweet: Identifiable, Sendable {
@@ -3694,11 +3451,13 @@ enum ForecastService {
     static func polymarketProvider(from data: Data, now: Date = Date()) throws -> ResetProviderSnapshot {
         guard
             let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let markets = root["markets"] as? [[String: Any]],
-            let eventURL = ForecastSource.polymarket.url
+            let markets = root["markets"] as? [[String: Any]]
         else { throw DashboardError.forecastUnavailable }
+        let eventURL = (root["slug"] as? String).flatMap {
+            URL(string: "https://polymarket.com/event/" + $0)
+        } ?? ForecastSource.polymarket.url!
 
-        let candidates = markets.compactMap { market -> (label: String, deadline: Date, yes: Double, no: Double)? in
+        let candidates = markets.compactMap { market -> (label: String, deadline: Date, yes: Double, no: Double, lastTrade: Bool)? in
             guard
                 (market["active"] as? Bool) != false,
                 (market["closed"] as? Bool) != true,
@@ -3714,21 +3473,36 @@ enum ForecastService {
                 let yesIndex = outcomes.firstIndex(where: { $0.caseInsensitiveCompare("yes") == .orderedSame }),
                 let noIndex = outcomes.firstIndex(where: { $0.caseInsensitiveCompare("no") == .orderedSame }),
                 prices.indices.contains(yesIndex), prices.indices.contains(noIndex),
-                let yes = Double(prices[yesIndex]), let no = Double(prices[noIndex])
+                let yes = Double(prices[yesIndex]), let no = Double(prices[noIndex]),
+                yes.isFinite, no.isFinite, (0...1).contains(yes), (0...1).contains(no)
             else { return nil }
             let label = (market["groupItemTitle"] as? String)
                 ?? deadline.formatted(date: .abbreviated, time: .omitted)
-            return (label, deadline, yes, no)
+            let bid = market["bestBid"] as? Double
+            let ask = market["bestAsk"] as? Double
+            let spread = bid.flatMap { bid in ask.map { $0 - bid } }
+                ?? (market["spread"] as? Double)
+            // Match Polymarket's display: wide books use the last trade, not midpoint.
+            if let spread, spread > 0.10 + 0.0000001 {
+                guard let last = market["lastTradePrice"] as? Double,
+                      last.isFinite, (0...1).contains(last) else { return nil }
+                return (label, deadline, last, 1 - last, true)
+            }
+            if let bid, let ask, bid.isFinite, ask.isFinite,
+               (0...1).contains(bid), (0...1).contains(ask), ask >= bid {
+                let midpoint = (bid + ask) / 2
+                return (label, deadline, midpoint, 1 - midpoint, false)
+            }
+            return (label, deadline, yes, no, false)
         }
         guard let earliest = candidates.min(by: { $0.deadline < $1.deadline }) else {
             throw DashboardError.forecastUnavailable
         }
 
-        let hedge = PolymarketResetHedge(
-            marketLabel: earliest.label,
-            deadline: earliest.deadline,
-            yesPrice: earliest.yes,
-            noPrice: earliest.no,
+        let forecast = PolymarketResetForecast(
+            points: candidates.sorted { $0.deadline < $1.deadline }.map {
+                .init(marketLabel: $0.label, deadline: $0.deadline, yesPrice: $0.yes, noPrice: $0.no, usesLastTrade: $0.lastTrade)
+            },
             url: eventURL
         )
         let score = earliest.yes * 100
@@ -3741,21 +3515,39 @@ enum ForecastService {
             lastBlessingAt: nil,
             tweets: [],
             metrics: [
-                ResetMetric(id: "polymarket-yes", label: "Reset by \(earliest.label)", value: percent(score), detail: "Polymarket Yes price"),
-                ResetMetric(id: "polymarket-no", label: "No reset", value: "\(Int((earliest.no * 100).rounded()))¢", detail: "Current No price")
+                ResetMetric(id: "polymarket-yes", label: "Reset by \(earliest.label)", value: percent(score), detail: earliest.lastTrade ? "Last trade (wide bid–ask gap)" : "Bid–ask midpoint"),
+                ResetMetric(id: "polymarket-no", label: "No reset", value: percent(earliest.no * 100), detail: "Market odds of no reset by this date")
             ],
             signals: [],
             updatedAt: (root["updatedAt"] as? String).flatMap(parseISODate) ?? now,
             forecastDeadline: earliest.deadline,
             announcement: nil,
-            polymarketHedge: hedge
+            polymarketForecast: forecast
         )
     }
 
+    static func polymarketSearchProvider(from data: Data, now: Date = Date()) throws -> ResetProviderSnapshot {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = root["events"] as? [[String: Any]] else { throw DashboardError.forecastUnavailable }
+        let candidates = events.filter {
+            ($0["slug"] as? String)?.hasPrefix("openai-resets-codex-weekly-usage-limit-by") == true
+                && ($0["closed"] as? Bool) != true
+                && ($0["active"] as? Bool) != false
+        }.sorted { ($0["startDate"] as? String ?? "") > ($1["startDate"] as? String ?? "") }
+        for event in candidates {
+            let payload = try JSONSerialization.data(withJSONObject: event)
+            if let provider = try? polymarketProvider(from: payload, now: now) { return provider }
+        }
+        throw DashboardError.forecastUnavailable
+    }
+
     private static func fetchPolymarket() async throws -> ResetProviderSnapshot {
-        let slug = "openai-resets-codex-weekly-usage-limit-byptptpt-20260901192000000"
-        let endpoint = URL(string: "https://gamma-api.polymarket.com/events/slug/\(slug)")!
-        return try polymarketProvider(from: await fetchData(endpoint))
+        let endpoint = URL(string: "https://gamma-api.polymarket.com/public-search?q=OpenAI%20resets%20Codex&limit_per_type=20")!
+        let provider = try polymarketSearchProvider(from: await fetchData(endpoint))
+        if let url = provider.polymarketForecast?.url {
+            UserDefaults.standard.set(url.absoluteString, forKey: "QuotaGlance.polymarketEventURL")
+        }
+        return provider
     }
 
     private static func fetchCodexResets() async throws -> ResetProviderSnapshot {
@@ -3819,7 +3611,7 @@ enum ForecastService {
             updatedAt: Date(),
             forecastDeadline: watch?.expectedAt,
             announcement: codexResetsAnnouncement(in: html, tweets: intel.tweets),
-            polymarketHedge: nil
+            polymarketForecast: nil
         )
     }
 
@@ -3868,7 +3660,7 @@ enum ForecastService {
             updatedAt: (root["fetchedAt"] as? String).flatMap(parseISODate),
             forecastDeadline: nil,
             announcement: announcement,
-            polymarketHedge: nil
+            polymarketForecast: nil
         )
     }
 
@@ -3963,7 +3755,7 @@ enum ForecastService {
             updatedAt: (root["generatedAt"] as? String).flatMap(parseISODate),
             forecastDeadline: nil,
             announcement: announcement,
-            polymarketHedge: nil
+            polymarketForecast: nil
         )
     }
 
@@ -4019,11 +3811,18 @@ enum ForecastService {
             updatedAt: firstCapture(#"checkedAt":"([^"]+)""#, in: normalized).flatMap(parseISODate),
             forecastDeadline: nil,
             announcement: announcement,
-            polymarketHedge: nil
+            polymarketForecast: nil
         )
     }
 
-    private static func announcementFromTweets(
+    static func isExplicitResetAnnouncement(_ text: String) -> Bool {
+        // Topic matches and provider flags alone are not an announcement.
+        let value = text.lowercased()
+        if value.range(of: #"\b(no|not|won't|wont|never|if|maybe|might|could)\b"#, options: .regularExpression) != nil { return false }
+        return value.range(of: #"\b(we(?:'re| are| will|'ll)\s+(?:doing |issuing |granting |giving |a |another |full |weekly )*reset(?:ting)?|(?:usage limits|quotas?|limits)\s+(?:have been|will be|are being)\s+reset|reset(?:s)?\s+(?:is coming|is incoming|is live|at \d|in \d|today|tonight|tomorrow))\b"#, options: .regularExpression) != nil
+    }
+
+    static func announcementFromTweets(
         _ tweets: [TiboTweet],
         source: ForecastSource,
         explicitlyAnnounced: Bool
@@ -4031,6 +3830,7 @@ enum ForecastService {
         guard explicitlyAnnounced else { return nil }
         let tweet = tweets
             .filter(\.isResetOriented)
+            .filter { source != .willCodexQuotaReset || isExplicitResetAnnouncement($0.text) }
             .max { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
         guard let tweet, let detectedAt = tweet.date else { return nil }
         return ResetAnnouncement(
@@ -4470,547 +4270,6 @@ enum ForecastService {
         return text.replacingOccurrences(of: "\u{00A0}", with: " ")
     }
 
-}
-
-struct DashboardView: View {
-    @ObservedObject var model: DashboardModel
-    @AppStorage(WidgetTheme.defaultsKey) private var themeRawValue = WidgetTheme.current.rawValue
-    @AppStorage(UsagePaceRate.defaultsKey) private var paceRateRawValue = UsagePaceRate.oneHour.rawValue
-    @AppStorage(DockPosition.defaultsKey) private var dockPositionRawValue = DockPosition.floating.rawValue
-    @State private var showingTweets = false
-    @State private var showingNewTweetAlert = false
-    @State private var showingUsageChart = false
-    @State private var showingSubscription = false
-    @State private var showingResetDetails = false
-
-    private var theme: WidgetTheme {
-        WidgetTheme(rawValue: themeRawValue) ?? .current
-    }
-
-    private var paceRate: UsagePaceRate {
-        UsagePaceRate(rawValue: paceRateRawValue) ?? .oneHour
-    }
-
-    private var dockPosition: DockPosition {
-        DockPosition(rawValue: dockPositionRawValue) ?? .floating
-    }
-
-    var body: some View {
-        GeometryReader { geometry in
-            let isVertical = geometry.size.height > geometry.size.width
-            let crossAxis = isVertical ? geometry.size.width : geometry.size.height
-            let mainAxis = isVertical ? geometry.size.height : geometry.size.width
-            let padding = max(6, min(12, crossAxis * 0.055))
-            let spacing = max(4, min(12, mainAxis * 0.017))
-            let interfaceScale = max(0.62, min(1.25, crossAxis / 220))
-            let compactRings = FloatingLayoutGeometry.isCompact(
-                NSSize(width: geometry.size.width, height: geometry.size.height)
-            )
-            let dialLayout = isVertical
-                ? AnyLayout(VStackLayout(spacing: spacing))
-                : AnyLayout(HStackLayout(spacing: spacing))
-
-            Group {
-                if dockPosition.isMounted {
-                    mountedRingView(position: dockPosition)
-                } else if compactRings {
-                    compactRingView
-                        .padding(max(7, min(14, crossAxis * 0.07)))
-                } else {
-                    dialLayout {
-                        dials(interfaceScale: interfaceScale)
-                    }
-                    .padding(padding)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .help(isVertical ? "Click for horizontal layout" : "Click for vertical layout")
-        }
-        .background {
-            if !dockPosition.isMounted {
-                ThemeShell(theme: theme)
-            }
-        }
-        .background {
-            DoubleClickActionView {
-                toggleOrientation()
-            }
-        }
-        .clipShape(DockClipShape(position: dockPosition))
-        .contentShape(DockClipShape(position: dockPosition))
-        .preferredColorScheme(theme.isLight ? .light : .dark)
-        .animation(.easeInOut(duration: 0.22), value: theme)
-        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: dockPosition)
-        .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceThemeChanged)) { notification in
-            if let rawValue = notification.object as? String {
-                themeRawValue = rawValue
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .quotaGlancePaceRateChanged)) { notification in
-            if let rawValue = notification.object as? String {
-                paceRateRawValue = rawValue
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceDockChanged)) { notification in
-            if let rawValue = notification.object as? String {
-                dockPositionRawValue = rawValue
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .quotaGlanceShowTweets)) { _ in
-            showingTweets = true
-        }
-        // The alert belongs to the persistent window, not to a particular
-        // dial layout. Keeping it here prevents dock/undock and orientation
-        // changes from presenting the same tweet again.
-        .popover(isPresented: $showingNewTweetAlert, arrowEdge: .top) {
-            if let tweet = model.newTweetAlert {
-                NewTweetAlertPopover(
-                    tweet: tweet,
-                    onOpenFeed: {
-                        showingNewTweetAlert = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                            showingTweets = true
-                        }
-                    },
-                    onClear: {
-                        model.clearNewTweetAlert()
-                        showingNewTweetAlert = false
-                    }
-                )
-            }
-        }
-        .onAppear {
-            showingNewTweetAlert = model.newTweetAlert != nil
-        }
-        .onChange(of: model.newTweetAlert?.id) { newID in
-            showingNewTweetAlert = newID != nil
-        }
-        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: model.newTweetAlert?.id)
-    }
-
-    @ViewBuilder private func dials(interfaceScale: CGFloat) -> some View {
-        ThemedInstrumentDial(
-            theme: theme,
-            progress: model.weekElapsedPercent,
-            color: Color(hex: 0xF2AD3E),
-            symbol: .resetDate(day: resetDay, time: resetClock),
-            detail: nil,
-            themeFooter: "\(resetDay) · \(resetClock)",
-            accessibilityLabel: resetAccessibilityLabel,
-            valueLabel: nil,
-            roundsPercentDown: true
-        )
-        .background(
-            RightClickActionView {
-                showingSubscription = true
-            }
-        )
-        .popover(isPresented: $showingSubscription, arrowEdge: .bottom) {
-            SubscriptionInfoPopover(planName: model.planName, theme: theme)
-        }
-        ThemedInstrumentDial(
-            theme: theme,
-            progress: model.usedPercent,
-            color: Color(hex: 0x2F80ED),
-            symbol: .codex,
-            detail: nil,
-            themeFooter: "⏱ \(usagePace.estimatedRunout.uppercased())",
-            accessibilityLabel: "Codex usage",
-            valueLabel: nil,
-            roundsPercentDown: false
-        )
-        .background(
-            RightClickActionView {
-                showingUsageChart = true
-            }
-        )
-        .popover(isPresented: $showingUsageChart, arrowEdge: .bottom) {
-            UsageChartPopover(
-                usageDays: model.usageDays,
-                usageHistory: model.usageHistory,
-                weeklyTokens: model.weeklyTokens,
-                localTokensTotal: model.localTokensTotal,
-                localTokenPace: model.localTokenPace,
-                usageIntelligence: model.usageIntelligence,
-                secondaryQuota: model.secondaryQuota,
-                quotaInventory: model.quotaInventory,
-                creditSummary: model.creditSummary,
-                resetCredits: model.resetCredits,
-                activeTasks: model.activeTasks,
-                weeklyArchives: model.weeklyArchives,
-                usedPercent: model.usedPercent,
-                windowStartDate: model.usageWindowStart,
-                resetAt: model.resetAt,
-                paceRate: paceRate,
-                theme: theme,
-                onRebuildIntelligence: model.rebuildUsageIntelligence,
-                onPurgeUsageData: model.purgeUsageData
-            )
-        }
-        ZStack(alignment: .topTrailing) {
-            ThemedInstrumentDial(
-                theme: theme,
-                progress: model.forecastPercent ?? 0,
-                color: Color(hex: 0x68D9A0),
-                symbol: .system("arrow.triangle.2.circlepath"),
-                detail: resetScheduleFooter ?? (model.resetAnnouncement == nil ? model.resetIntel?.compactLabel : "🔥 USE IT NOW"),
-                themeFooter: resetScheduleFooter ?? (model.resetAnnouncement == nil ? model.resetIntel?.compactLabel : "🔥 USE IT NOW"),
-                accessibilityLabel: "24-hour quota reset chance",
-                // A custom label is only needed for values such as “>70%”.
-                // Otherwise let the dial render its live numeric progress;
-                // forcing the fallback string here made every provider read 0%.
-                valueLabel: model.forecastLabel,
-                roundsPercentDown: false,
-                alerting: model.resetAnnouncement != nil
-            )
-
-            if !(model.resetIntel?.tweets.isEmpty ?? true) {
-                Button {
-                    showingTweets = true
-                } label: {
-                    Image(systemName: "text.bubble.fill")
-                        .font(.system(size: max(8, 11 * interfaceScale), weight: .semibold))
-                        .foregroundStyle(Color(hex: 0x68D9A0))
-                        .frame(width: max(16, 25 * interfaceScale), height: max(16, 25 * interfaceScale))
-                        .background(
-                            Circle()
-                                .fill(Color(hex: 0x0D1115).opacity(0.9))
-                                .overlay(Circle().stroke(Color(hex: 0x68D9A0).opacity(0.42), lineWidth: 1))
-                        )
-                }
-                .buttonStyle(.plain)
-                .padding(max(4, 8 * interfaceScale))
-                .help("Tibo reset posts")
-                // Open above the reset dial in the compact vertical layout so
-                // the feed gets room to show full post text instead of being
-                // squeezed against the bottom of the screen.
-                .popover(isPresented: $showingTweets, arrowEdge: .top) {
-                    TiboTweetsPopover(tweets: model.resetIntel?.tweets ?? [])
-                }
-            }
-        }
-        .background(
-            RightClickActionView {
-                showingResetDetails = true
-            }
-        )
-        .popover(isPresented: $showingResetDetails, arrowEdge: .bottom) {
-            ResetCalculatorPopover(
-                snapshot: model.forecastSnapshot,
-                effectiveScore: model.forecastPercent,
-                announcementActive: model.resetAnnouncement != nil,
-                status: model.forecastStatus,
-                lifecycle: model.resetLifecycle,
-                theme: theme
-            )
-        }
-    }
-
-    private var compactRingView: some View {
-        ZStack {
-            MountedQuotaRings(
-                calendarProgress: model.weekElapsedPercent ?? 0,
-                usageProgress: model.usedPercent ?? 0,
-                resetProgress: model.forecastPercent ?? 0,
-                calendarDetail: compactResetDate,
-                usageDetail: compactPaceLabel,
-                resetDetail: model.resetIntel?.compactLabel ?? "🙏🏻 —",
-                resetCountdownAt: prominentResetCountdownAt,
-                resetAnnounced: model.resetAnnouncement != nil,
-                theme: theme,
-                position: .floating
-            )
-
-            if !(model.resetIntel?.tweets.isEmpty ?? true) {
-                Button {
-                    showingTweets = true
-                } label: {
-                    Image(systemName: "text.bubble.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Color(hex: 0x68D9A0))
-                        .frame(width: 28, height: 28)
-                        .background(
-                            Circle()
-                                .fill(theme.isLight ? Color.white.opacity(0.92) : Color(hex: 0x0D1115).opacity(0.94))
-                                .overlay(Circle().stroke(Color(hex: 0x68D9A0).opacity(0.48), lineWidth: 1))
-                        )
-                }
-                .buttonStyle(.plain)
-                .help("Tibo reset posts")
-                .popover(isPresented: $showingTweets, arrowEdge: .top) {
-                    TiboTweetsPopover(tweets: model.resetIntel?.tweets ?? [])
-                }
-            }
-
-        }
-        .background(
-            CompactRingActionView(
-                calendarAction: { showingSubscription = true },
-                usageAction: { showingUsageChart = true },
-                resetAction: { showingResetDetails = true }
-            )
-        )
-        .popover(isPresented: $showingSubscription, arrowEdge: .bottom) {
-            SubscriptionInfoPopover(planName: model.planName, theme: theme)
-        }
-        .popover(isPresented: $showingUsageChart, arrowEdge: .bottom) {
-            UsageChartPopover(
-                usageDays: model.usageDays,
-                usageHistory: model.usageHistory,
-                weeklyTokens: model.weeklyTokens,
-                localTokensTotal: model.localTokensTotal,
-                localTokenPace: model.localTokenPace,
-                usageIntelligence: model.usageIntelligence,
-                secondaryQuota: model.secondaryQuota,
-                quotaInventory: model.quotaInventory,
-                creditSummary: model.creditSummary,
-                resetCredits: model.resetCredits,
-                activeTasks: model.activeTasks,
-                weeklyArchives: model.weeklyArchives,
-                usedPercent: model.usedPercent,
-                windowStartDate: model.usageWindowStart,
-                resetAt: model.resetAt,
-                paceRate: paceRate,
-                theme: theme,
-                onRebuildIntelligence: model.rebuildUsageIntelligence,
-                onPurgeUsageData: model.purgeUsageData
-            )
-        }
-        .popover(isPresented: $showingResetDetails, arrowEdge: .bottom) {
-            ResetCalculatorPopover(
-                snapshot: model.forecastSnapshot,
-                effectiveScore: model.forecastPercent,
-                announcementActive: model.resetAnnouncement != nil,
-                status: model.forecastStatus,
-                lifecycle: model.resetLifecycle,
-                theme: theme
-            )
-        }
-        .help("Orange: calendar · Indigo: Codex usage · Green: reset estimate")
-    }
-
-    private func mountedRingView(position: DockPosition) -> some View {
-        GeometryReader { geometry in
-            let metrics = DockMetrics(position: position, size: geometry.size)
-            ZStack {
-                if position.isEdge {
-                    MountedQuotaRail(
-                        calendarProgress: model.weekElapsedPercent ?? 0,
-                        usageProgress: model.usedPercent ?? 0,
-                        resetProgress: model.forecastPercent ?? 0,
-                        resetCountdownAt: prominentResetCountdownAt,
-                        resetAnnounced: model.resetAnnouncement != nil,
-                        theme: theme,
-                        position: position
-                    )
-                } else {
-                    MountedQuotaRings(
-                        calendarProgress: model.weekElapsedPercent ?? 0,
-                        usageProgress: model.usedPercent ?? 0,
-                        resetProgress: model.forecastPercent ?? 0,
-                        calendarDetail: compactResetDate,
-                        usageDetail: compactPaceLabel,
-                        resetDetail: model.resetIntel?.compactLabel ?? "🙏🏻 —",
-                        resetCountdownAt: prominentResetCountdownAt,
-                        resetAnnounced: model.resetAnnouncement != nil,
-                        theme: theme,
-                        position: position
-                    )
-                }
-
-                if !(model.resetIntel?.tweets.isEmpty ?? true) {
-                    Button {
-                        showingTweets = true
-                    } label: {
-                        Image(systemName: "text.bubble.fill")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(Color(hex: 0x68D9A0))
-                            .frame(width: 27, height: 27)
-                            .background(
-                                Circle()
-                                    .fill(theme.isLight ? Color.white.opacity(0.94) : Color(hex: 0x0D1115).opacity(0.95))
-                                    .overlay(Circle().stroke(Color(hex: 0x68D9A0).opacity(0.52), lineWidth: 1))
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .position(metrics.controlPoint)
-                    .help("Tibo reset posts")
-                    .popover(isPresented: $showingTweets, arrowEdge: metrics.popoverEdge) {
-                        TiboTweetsPopover(tweets: model.resetIntel?.tweets ?? [])
-                    }
-                }
-
-            }
-            .background(
-                MountedRingActionView(
-                    position: position,
-                    calendarAction: { showingSubscription = true },
-                    usageAction: { showingUsageChart = true },
-                    resetAction: { showingResetDetails = true }
-                )
-            )
-        }
-        .popover(isPresented: $showingSubscription, arrowEdge: .bottom) {
-            SubscriptionInfoPopover(planName: model.planName, theme: theme)
-        }
-        .popover(isPresented: $showingUsageChart, arrowEdge: .bottom) {
-            UsageChartPopover(
-                usageDays: model.usageDays,
-                usageHistory: model.usageHistory,
-                weeklyTokens: model.weeklyTokens,
-                localTokensTotal: model.localTokensTotal,
-                localTokenPace: model.localTokenPace,
-                usageIntelligence: model.usageIntelligence,
-                secondaryQuota: model.secondaryQuota,
-                quotaInventory: model.quotaInventory,
-                creditSummary: model.creditSummary,
-                resetCredits: model.resetCredits,
-                activeTasks: model.activeTasks,
-                weeklyArchives: model.weeklyArchives,
-                usedPercent: model.usedPercent,
-                windowStartDate: model.usageWindowStart,
-                resetAt: model.resetAt,
-                paceRate: paceRate,
-                theme: theme,
-                onRebuildIntelligence: model.rebuildUsageIntelligence,
-                onPurgeUsageData: model.purgeUsageData
-            )
-        }
-        .popover(isPresented: $showingResetDetails, arrowEdge: .bottom) {
-            ResetCalculatorPopover(
-                snapshot: model.forecastSnapshot,
-                effectiveScore: model.forecastPercent,
-                announcementActive: model.resetAnnouncement != nil,
-                status: model.forecastStatus,
-                lifecycle: model.resetLifecycle,
-                theme: theme
-            )
-        }
-        .help("Drag away to unmount · Orange: calendar · Blue: usage · Green: reset")
-    }
-
-    private func toggleOrientation() {
-        guard let window = NSApp.windows.first(where: { $0.title == "Quota Glance" }) else { return }
-
-        if dockPosition.isMounted {
-            WindowDockController.shared.undock(window)
-            return
-        }
-
-        let oldFrame = window.frame
-        let center = CGPoint(x: oldFrame.midX, y: oldFrame.midY)
-        let isCompact = max(oldFrame.width, oldFrame.height) < 340
-            && oldFrame.width * oldFrame.height < 50_000
-        let newVertical = oldFrame.width >= oldFrame.height
-        let minimumSize = newVertical
-            ? NSSize(width: 140, height: 420)
-            : NSSize(width: 420, height: 140)
-        let maximumSize = newVertical
-            ? NSSize(width: 400, height: 1200)
-            : NSSize(width: 1200, height: 400)
-
-        // A three-dial strip has the same area in either orientation. Derive
-        // one dial side from the current window area so rotating never causes
-        // the dramatic growth produced by independent width/height minimums.
-        let oldArea = max(1, oldFrame.width * oldFrame.height)
-        let unclampedDialSide = isCompact ? 140 : sqrt(oldArea / 3)
-        let dialSide = min(400, max(140, unclampedDialSide))
-        let newSize = newVertical
-            ? NSSize(width: dialSide, height: dialSide * 3)
-            : NSSize(width: dialSide * 3, height: dialSide)
-
-        window.contentMinSize = minimumSize
-        window.contentMaxSize = maximumSize
-        window.minSize = minimumSize
-        window.maxSize = maximumSize
-
-        let newFrame = NSRect(
-            x: center.x - newSize.width / 2,
-            y: center.y - newSize.height / 2,
-            width: newSize.width,
-            height: newSize.height
-        )
-        window.setFrame(newFrame, display: true, animate: true)
-    }
-
-    private var resetDay: String {
-        guard let date = model.resetAt else { return "—" }
-        return date.formatted(.dateTime.weekday(.abbreviated).day()).uppercased()
-    }
-
-    private var resetClock: String {
-        guard let date = model.resetAt else { return "—" }
-        return date.formatted(.dateTime.hour().minute()).uppercased()
-    }
-
-    private var usagePace: UsagePace {
-        UsagePace.calculate(
-            usedPercent: model.usedPercent,
-            windowStartDate: model.usageWindowStart,
-            resetAt: model.resetAt,
-            usageHistory: model.usageHistory,
-            localTokensTotal: model.localTokensTotal,
-            localTokenPace: model.localTokenPace,
-            usageIntelligence: model.usageIntelligence,
-            rate: paceRate
-        )
-    }
-
-    private var compactResetDate: String {
-        guard let date = model.resetAt else { return "↻ —" }
-        let formatter = DateFormatter()
-        formatter.timeZone = .autoupdatingCurrent
-        formatter.dateFormat = "E h:mma"
-        return "↻ " + formatter.string(from: date).uppercased()
-    }
-
-    private var compactPaceLabel: String {
-        let value = usagePace.estimatedRunout.uppercased()
-        let shortened: String
-        switch value {
-        case "COLLECTING", "CALIBRATING": shortened = "LEARNING"
-        case "STEADY", "IDLE", "UNUSED", "NOW", "—": shortened = value
-        default: shortened = value.split(separator: " ").prefix(2).joined(separator: " ")
-        }
-        return "⏱ " + shortened
-    }
-
-    private var resetAccessibilityLabel: String {
-        if model.resetDeadlineIsCredit {
-            return "Reset credit expires \(resetDay) at \(resetClock)"
-        }
-        return "Week elapsed, resets \(resetDay) at \(resetClock)"
-    }
-
-    private var resetScheduleFooter: String? {
-        guard let expectedAt = prominentResetCountdownAt else { return nil }
-        if model.resetLifecycle.isDelayed(), expectedAt == model.resetLifecycle.activeExpectedAt() {
-            return "⚠ DELAYED · \(Self.localTime(expectedAt))"
-        }
-        return "⏳ \(Self.countdown(to: expectedAt)) · \(Self.localTime(expectedAt))"
-    }
-
-    private var prominentResetCountdownAt: Date? {
-        guard model.resetAnnouncement != nil else { return nil }
-        return model.resetLifecycle.activeExpectedAt()
-    }
-
-    private static func countdown(to date: Date, now: Date = Date()) -> String {
-        let totalMinutes = max(0, Int(ceil(date.timeIntervalSince(now) / 60)))
-        let days = totalMinutes / 1_440
-        let hours = (totalMinutes % 1_440) / 60
-        let minutes = totalMinutes % 60
-        if days > 0 { return "\(days)D \(hours)H" }
-        if hours > 0 { return "\(hours)H \(minutes)M" }
-        return "\(minutes)M"
-    }
-
-    private static func localTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeZone = .autoupdatingCurrent
-        formatter.dateFormat = "h:mm a z"
-        return formatter.string(from: date).uppercased()
-    }
 }
 
 private enum ResetCountdownLabel {
@@ -6661,8 +5920,8 @@ struct ResetCalculatorPopover: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if let hedge = snapshot.providers.compactMap(\.polymarketHedge).first {
-                    polymarketHedgeCard(hedge)
+                if let hedge = snapshot.providers.compactMap(\.polymarketForecast).first {
+                    polymarketForecastCard(hedge)
                 }
 
                 if let provider = detailProvider, !provider.metrics.isEmpty {
@@ -6748,8 +6007,8 @@ struct ResetCalculatorPopover: View {
                     .monospacedDigit()
                     .foregroundStyle(palette.primary)
                 Text(snapshot.source == .polymarket
-                    ? "BY \(snapshot.providers.compactMap(\.polymarketHedge).first?.marketLabel.uppercased() ?? "MARKET DEADLINE")"
-                    : "NEXT 24 HOURS")
+                    ? "BY \(snapshot.providers.compactMap(\.polymarketForecast).first?.points.first?.marketLabel.uppercased() ?? "MARKET DEADLINE")"
+                    : (snapshot.selectedSources.contains(.polymarket) ? "SELECTED FORECASTS" : "NEXT 24 HOURS"))
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
                     .tracking(0.8)
                     .foregroundStyle(palette.reset)
@@ -6787,66 +6046,86 @@ struct ResetCalculatorPopover: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(palette.surface))
     }
 
-    private func polymarketHedgeCard(_ hedge: PolymarketResetHedge) -> some View {
-        Button {
-            NSWorkspace.shared.open(hedge.url)
-        } label: {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack(spacing: 7) {
-                    Image(systemName: "chart.line.uptrend.xyaxis")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(palette.reset)
-                    Text("CHEAPER RESET · POLYMARKET")
-                        .font(.system(size: 8, weight: .bold, design: .monospaced))
-                        .foregroundStyle(palette.tertiary)
-                    Spacer()
-                    Text("NO \(Int((hedge.noPrice * 100).rounded()))¢")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(palette.reset)
-                }
-
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Bet $\(hedge.stake, specifier: "%.2f") on No")
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
-                            .foregroundStyle(palette.primary)
-                        Text("No reset by \(hedge.marketLabel) → $80 gross payout")
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
-                            .foregroundStyle(palette.secondary)
-                    }
-                    Spacer(minLength: 12)
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text("+$\(hedge.grossProfit, specifier: "%.2f")")
-                            .font(.system(size: 15, weight: .semibold, design: palette.numberDesign))
-                            .foregroundStyle(palette.reset)
-                        Text("profit")
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundStyle(palette.tertiary)
-                    }
-                }
-
-                HStack {
-                    Text("Reset happens: lose the stake, receive the quota reset")
-                    Spacer()
-                    Text("VIEW ↗")
-                }
-                .font(.system(size: 8, weight: .medium, design: .monospaced))
-                .foregroundStyle(palette.tertiary)
-
-                Text("LIVE INDICATIVE PRICE · BEFORE FEES AND SLIPPAGE")
-                    .font(.system(size: 7, weight: .bold, design: .monospaced))
-                    .foregroundStyle(palette.tertiary.opacity(0.8))
+    private func polymarketForecastCard(_ forecast: PolymarketResetForecast) -> some View {
+        let firstDeadline = forecast.points.first?.deadline.timeIntervalSince1970 ?? 0
+        let lastDeadline = max(forecast.points.last?.deadline.timeIntervalSince1970 ?? 1, firstDeadline + 1)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("RESET OUTLOOK")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(palette.primary)
+                Spacer()
+                Link("POLYMARKET ↗", destination: forecast.url)
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .foregroundStyle(palette.reset)
             }
-            .padding(11)
-            .background(
-                RoundedRectangle(cornerRadius: 9)
-                    .fill(palette.surface)
-                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(palette.reset.opacity(0.32), lineWidth: 0.8))
-            )
-            .contentShape(Rectangle())
+            Text("Chance of a reset by each date")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(palette.secondary)
+
+            Chart(forecast.points) { point in
+                LineMark(
+                    x: .value("Deadline", point.deadline.timeIntervalSince1970),
+                    y: .value("Reset chance", point.yesPrice * 100)
+                )
+                .foregroundStyle(palette.reset)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+                PointMark(
+                    x: .value("Deadline", point.deadline.timeIntervalSince1970),
+                    y: .value("Reset chance", point.yesPrice * 100)
+                )
+                .foregroundStyle(palette.reset)
+                .symbolSize(30)
+                .annotation(position: .top, spacing: 5) {
+                    Text("\(Int((point.yesPrice * 100).rounded()))%\(point.usesLastTrade ? "*" : "")")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(palette.primary)
+                }
+                .accessibilityLabel("By \(point.marketLabel)")
+                .accessibilityValue("Reset: \(Int((point.yesPrice * 100).rounded())) percent. No reset: \(Int((point.noPrice * 100).rounded())) percent.")
+            }
+            .chartYScale(domain: 0...100)
+            .chartXScale(domain: firstDeadline...lastDeadline, range: .plotDimension(padding: 28))
+            .chartPlotStyle { plot in plot.padding(.top, 20) }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: [0, 50, 100]) { value in
+                    AxisGridLine().foregroundStyle(palette.rule)
+                    AxisValueLabel {
+                        if let number = value.as(Int.self) {
+                            Text("\(number)%").foregroundStyle(palette.tertiary)
+                        }
+                    }
+                }
+            }
+            .chartXAxis {
+                // Numeric timestamps avoid Swift Charts centering date labels in calendar bins.
+                // Both marks and ticks share the exact deadline coordinate.
+                AxisMarks(values: forecast.points.map { $0.deadline.timeIntervalSince1970 }) { value in
+                    AxisTick(length: 4).foregroundStyle(palette.rule)
+                    AxisValueLabel(centered: false, anchor: .top, collisionResolution: .disabled) {
+                        if let timestamp = value.as(Double.self),
+                           let point = forecast.points.first(where: { $0.deadline.timeIntervalSince1970 == timestamp }) {
+                            Text(point.axisLabel)
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .fixedSize()
+                                .foregroundStyle(palette.secondary)
+                        }
+                    }
+                }
+            }
+            .frame(height: 145)
+
+            Text("Market estimates by each deadline. *Last trade: bid–ask gap exceeds 10¢; the trade may be old.")
+                .font(.system(size: 9))
+                .foregroundStyle(palette.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .buttonStyle(.plain)
-        .help("View the earliest Codex reset market. Prices move; figures exclude fees and slippage.")
+        .padding(11)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(palette.surface)
+                .overlay(RoundedRectangle(cornerRadius: 9).stroke(palette.reset.opacity(0.32), lineWidth: 0.8))
+        )
     }
 
     private func providerRow(_ source: ForecastSource, provider: ResetProviderSnapshot?) -> some View {
@@ -7069,7 +6348,7 @@ private struct TweetRow: View {
     }
 }
 
-private struct NewTweetAlertPopover: View {
+struct NewTweetAlertPopover: View {
     let tweet: TiboTweet
     let onOpenFeed: () -> Void
     let onClear: () -> Void
@@ -8049,6 +7328,8 @@ struct UsageChartPopover: View {
             }
             .font(.system(size: 8, weight: .bold, design: .monospaced))
             .foregroundStyle(palette.secondary)
+
+            gpt6UsageLine(intelligence)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -8108,6 +7389,28 @@ struct UsageChartPopover: View {
             .replacingOccurrences(of: "gpt-", with: "GPT ")
             .replacingOccurrences(of: "-", with: " ")
             .uppercased()
+    }
+
+    @ViewBuilder
+    private func gpt6UsageLine(_ intelligence: UsageIntelligenceSnapshot) -> some View {
+        let models = intelligence.modelSummaries
+            .filter { $0.gpt6CodexCredits != nil }
+            .map { readableModel($0.model) }
+        if let credits = intelligence.gpt6CodexCredits, !models.isEmpty {
+            HStack(spacing: 6) {
+                Text(models.joined(separator: " / "))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .foregroundStyle(palette.secondary)
+                Spacer(minLength: 4)
+                Text(String(format: "Codex %.1f cr", credits))
+                    .monospacedDigit()
+                    .foregroundStyle(palette.pace)
+            }
+            .font(.system(size: 7, weight: .bold, design: .monospaced))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("GPT-6 models: \(models.joined(separator: ", ")). Estimated Codex credit usage \(String(format: "%.1f", credits)) credits.")
+        }
     }
 
     private func relativeReset(_ date: Date) -> String {

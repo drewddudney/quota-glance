@@ -1,7 +1,7 @@
 import Foundation
 import UserNotifications
 
-struct NotificationPreferences {
+struct NotificationPreferences: Equatable {
     private enum Key {
         static let reset = "QuotaGlance.notify.reset"
         static let resetCompleted = "QuotaGlance.notify.resetCompleted"
@@ -15,6 +15,8 @@ struct NotificationPreferences {
         static let tibo = "QuotaGlance.notify.tibo"
         static let codexTasks = "QuotaGlance.notify.codexTasks"
         static let sessionLiveActivity = "QuotaGlance.liveActivity.codexSession"
+        static let claudeUsage = "QuotaGlance.notify.claudeUsage"
+        static let claudeWeek = "QuotaGlance.notify.claudeWeek"
     }
 
     var resetAnnounced: Bool
@@ -29,6 +31,8 @@ struct NotificationPreferences {
     var tiboPosts: Bool
     var codexTasks: Bool
     var sessionLiveActivity: Bool
+    var claudeUsage: Bool
+    var claudeWeek: Bool
 
     static func load() -> NotificationPreferences {
         let defaults = UserDefaults.standard
@@ -63,7 +67,9 @@ struct NotificationPreferences {
             codexTasks: defaults.object(forKey: Key.codexTasks) == nil ? true : defaults.bool(forKey: Key.codexTasks),
             sessionLiveActivity: defaults.object(forKey: Key.sessionLiveActivity) == nil
                 ? true
-                : defaults.bool(forKey: Key.sessionLiveActivity)
+                : defaults.bool(forKey: Key.sessionLiveActivity),
+            claudeUsage: defaults.object(forKey: Key.claudeUsage) == nil ? true : defaults.bool(forKey: Key.claudeUsage),
+            claudeWeek: defaults.object(forKey: Key.claudeWeek) == nil ? true : defaults.bool(forKey: Key.claudeWeek)
         )
     }
 
@@ -81,6 +87,51 @@ struct NotificationPreferences {
         defaults.set(tiboPosts, forKey: Key.tibo)
         defaults.set(codexTasks, forKey: Key.codexTasks)
         defaults.set(sessionLiveActivity, forKey: Key.sessionLiveActivity)
+        defaults.set(claudeUsage, forKey: Key.claudeUsage)
+        defaults.set(claudeWeek, forKey: Key.claudeWeek)
+    }
+}
+
+/// Notification request identifiers replace pending requests, but submitting an
+/// already delivered identifier can still show another banner. Keep our own
+/// durable record and reserve in-flight requests before yielding to iOS.
+@MainActor
+final class NotificationDelivery {
+    static let shared = NotificationDelivery()
+    static let eventKey = "QuotaGlance.deliveredNotificationEvents.v1"
+    let defaults: UserDefaults
+    private var pending = Set<String>()
+    private let submit: (UNNotificationRequest) async throws -> Void
+
+    init(defaults: UserDefaults = .standard,
+         submit: @escaping (UNNotificationRequest) async throws -> Void = {
+             try await UNUserNotificationCenter.current().add($0)
+         }) {
+        self.defaults = defaults
+        self.submit = submit
+    }
+
+    func remember(_ identifiers: [String]) {
+        var seen = Set<String>()
+        let ordered = (identifiers + (defaults.stringArray(forKey: Self.eventKey) ?? []))
+            .filter { seen.insert($0).inserted }
+        defaults.set(Array(ordered.prefix(1_024)), forKey: Self.eventKey)
+    }
+
+    @discardableResult
+    func add(_ content: UNNotificationContent, identifier: String, deduplicate: Bool = true) async -> Bool {
+        guard !pending.contains(identifier),
+              !deduplicate || !(defaults.stringArray(forKey: Self.eventKey) ?? []).contains(identifier) else { return false }
+        pending.insert(identifier)
+        defer { pending.remove(identifier) }
+        do {
+            try await submit(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+            if deduplicate { remember([identifier]) }
+            return true
+        } catch {
+            // A failed submission can be retried; a delivered event cannot.
+            return false
+        }
     }
 }
 
@@ -99,21 +150,33 @@ enum NotificationManager {
         )) == true
     }
 
-    static func evaluate(
+    @MainActor static func evaluate(
         _ snapshot: QuotaSnapshot,
         previous: QuotaSnapshot? = nil,
-        preferences: NotificationPreferences
+        preferences: NotificationPreferences,
+        delivery suppliedDelivery: NotificationDelivery? = nil
     ) async {
-        let defaults = UserDefaults.standard
+        let delivery = suppliedDelivery ?? .shared
+        let defaults = delivery.defaults
+        migrateDeliveredEvents(previous: previous, delivery: delivery)
+        if preferences.claudeUsage || preferences.claudeWeek {
+            await evaluateClaude(snapshot.claude, previous: previous?.claude, preferences: preferences)
+        }
         let posts = snapshot.tiboPosts ?? []
         let tiboState = tiboNotificationState(posts: posts, defaults: defaults)
+        // Reserve the feed before any notification awaits. A foreground refresh
+        // and a finishing background refresh may otherwise both select it.
+        saveTiboNotificationState(tiboState, defaults: defaults)
         let newestPost = tiboState.newPost
         let newlyConfirmedByTibo = newestPost.map { isResetCompletionPost($0) } ?? false
         let newlyConfirmedByUsage = didUsageReset(previous: previous, current: snapshot)
+        let announcementIdentity = canonicalAnnouncementIdentity(snapshot)
+        let announcementCoversPost = preferences.resetAnnounced && snapshot.effectiveResetAnnounced
+            && announcementIdentity != nil && announcementIdentity == newestPost?.canonicalIdentity
 
         if preferences.resetCompleted,
            (newlyConfirmedByTibo || newlyConfirmedByUsage),
-           !wasResetCompletionRecentlyNotified() {
+           !wasResetCompletionRecentlyNotified(defaults: defaults) {
             let completionID: String = {
                 if newlyConfirmedByUsage {
                     let anchor = snapshot.usageWindowStart ?? snapshot.resetAt ?? snapshot.capturedAt
@@ -132,21 +195,21 @@ enum NotificationManager {
             content.interruptionLevel = preferences.prominentResetAlert ? .timeSensitive : .active
             content.relevanceScore = preferences.prominentResetAlert ? 1 : 0.6
             content.threadIdentifier = "codex-reset-announcements"
-            await add(content, identifier: "reset-completed-\(completionID)")
-            defaults.set(completionID, forKey: lastCompletionKey)
-            defaults.set(Date().timeIntervalSince1970, forKey: lastCompletionAtKey)
+            if await delivery.add(content, identifier: "reset-completed-\(completionID)") {
+                defaults.set(completionID, forKey: lastCompletionKey)
+                defaults.set(Date().timeIntervalSince1970, forKey: lastCompletionAtKey)
+            }
         }
 
         if preferences.tiboPosts, let newest = tiboState.newPost {
-            if !newlyConfirmedByTibo {
+            if !(newlyConfirmedByTibo && preferences.resetCompleted) && !announcementCoversPost {
                 let content = UNMutableNotificationContent()
                 content.title = newest.isResetOriented ? "New Tibo reset post" : "New Tibo post"
                 content.body = String(newest.text.prefix(180))
                 content.sound = .default
-                await add(content, identifier: "tibo-post-\(newest.canonicalIdentity)")
+                await delivery.add(content, identifier: "tibo-post-\(newest.canonicalIdentity)")
             }
         }
-        saveTiboNotificationState(tiboState, defaults: defaults)
 
         if preferences.codexTasks, let previous {
             let old = Dictionary(uniqueKeysWithValues: (previous.activeTasks ?? []).map { ($0.id, $0) })
@@ -158,14 +221,14 @@ enum NotificationManager {
                 content.title = normalized.contains("approval") ? "Codex needs approval" : normalized.contains("stalled") ? "Codex task stalled" : "Codex task finished"
                 content.body = task.name
                 content.sound = .default
-                await add(content, identifier: "codex-task-\(task.id)-\(task.state)")
+                await delivery.add(content, identifier: "codex-task-\(task.id)-\(task.state)", deduplicate: false)
             }
         }
 
         if preferences.resetAnnounced,
            snapshot.effectiveResetAnnounced,
            let announcementID = snapshot.announcementID,
-           UserDefaults.standard.string(forKey: lastAnnouncementKey) != announcementID {
+           let announcementIdentity {
             let content = UNMutableNotificationContent()
             content.title = preferences.prominentResetAlert
                 ? "⚠️ CODEX RESET INCOMING"
@@ -182,8 +245,9 @@ enum NotificationManager {
             content.interruptionLevel = preferences.prominentResetAlert ? .timeSensitive : .active
             content.relevanceScore = preferences.prominentResetAlert ? 1 : 0.5
             content.threadIdentifier = "codex-reset-announcements"
-            await add(content, identifier: "reset-announced-\(announcementID)")
-            UserDefaults.standard.set(announcementID, forKey: lastAnnouncementKey)
+            if await delivery.add(content, identifier: "reset-announced-\(announcementIdentity)") {
+                defaults.set(announcementID, forKey: lastAnnouncementKey)
+            }
         }
 
         if preferences.usageApproachingLimit,
@@ -191,14 +255,15 @@ enum NotificationManager {
            usage >= preferences.usageThreshold {
             let window = snapshot.usageWindowStart?.timeIntervalSince1970 ?? 0
             let key = "\(Int(window))-\(Int(preferences.usageThreshold))"
-            if UserDefaults.standard.string(forKey: usageWindowKey) != key {
+            if defaults.string(forKey: usageWindowKey) != key {
                 let content = UNMutableNotificationContent()
                 content.title = "Codex usage is at \(Int(usage.rounded()))%"
                 content.body = snapshot.resetAt.map { "Your current limit resets \($0.formatted(.relative(presentation: .named)))." }
                     ?? "You’re approaching the weekly limit."
                 content.sound = .default
-                await add(content, identifier: "usage-threshold-\(key)")
-                UserDefaults.standard.set(key, forKey: usageWindowKey)
+                if await delivery.add(content, identifier: "usage-threshold-\(key)") {
+                    defaults.set(key, forKey: usageWindowKey)
+                }
             }
         }
 
@@ -230,15 +295,47 @@ enum NotificationManager {
             content.title = "Codex pace is running hot"
             content.body = "At the \(snapshot.paceWindowLabel ?? "recent") rate, quota may run out \(runout.formatted(.relative(presentation: .named)))."
             content.sound = .default
-            await add(content, identifier: identifier)
+            await delivery.add(content, identifier: identifier, deduplicate: false)
         }
 
         if preferences.staleSync,
            Date().timeIntervalSince(snapshot.capturedAt) > 6 * 3_600 {
             let content = UNMutableNotificationContent()
             content.title = "Quota Glance hasn’t synced"
-            content.body = "Open Quota Glance on your Mac to refresh Codex usage."
-            await add(content, identifier: "stale-sync")
+            content.body = "Open Quota Glance to refresh your connected accounts."
+            await delivery.add(content, identifier: "stale-sync", deduplicate: false)
+        }
+    }
+
+    @MainActor private static var pendingClaudeAlerts = Set<String>()
+
+    @MainActor private static func evaluateClaude(
+        _ current: ClaudeQuotaSnapshot?, previous: ClaudeQuotaSnapshot?, preferences: NotificationPreferences
+    ) async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        guard [.authorized, .provisional, .ephemeral].contains(settings.authorizationStatus) else { return }
+        let key = "QuotaGlance.notifiedClaudeEvents.v1"
+        let defaults = UserDefaults.standard
+        let seen = Set(defaults.stringArray(forKey: key) ?? []).union(pendingClaudeAlerts)
+        let events = ClaudeNotificationPolicy.events(
+            current: current, previous: previous, usageEnabled: preferences.claudeUsage,
+            weekEnabled: preferences.claudeWeek, threshold: preferences.usageThreshold, seen: seen
+        )
+        pendingClaudeAlerts.formUnion(events.map(\.id))
+        for event in events {
+            let content = UNMutableNotificationContent()
+            content.title = event.title
+            content.body = event.body
+            content.sound = .default
+            content.threadIdentifier = "claude-usage"
+            content.userInfo = ["provider": "claude"]
+            do {
+                try await center.add(UNNotificationRequest(identifier: event.id, content: content, trigger: nil))
+                let saved = defaults.stringArray(forKey: key) ?? []
+                defaults.set(Array(([event.id] + saved).prefix(64)), forKey: key)
+            } catch { /* A later sync may retry an alert that could not be added. */ }
+            pendingClaudeAlerts.remove(event.id)
         }
     }
 
@@ -246,6 +343,43 @@ enum NotificationManager {
         let newPost: QuotaTiboPost?
         let identities: [String]
         let watermark: Date?
+    }
+
+    static func canonicalAnnouncementIdentity(_ snapshot: QuotaSnapshot) -> String? {
+        guard let id = snapshot.announcementID else { return nil }
+        return canonicalAnnouncementIdentity(id: id, url: snapshot.announcementURL)
+    }
+
+    private static func canonicalAnnouncementIdentity(id: String, url: URL? = nil) -> String {
+        var sourceID = id
+        let prefixes = ["lunar:", "will:", "gussuri:", "scheduled:"]
+        while let prefix = prefixes.first(where: sourceID.hasPrefix) {
+            sourceID.removeFirst(prefix.count)
+        }
+        let post = QuotaTiboPost(id: sourceID, date: nil, text: "", inReplyTo: nil,
+                                 url: url, isResetOriented: true)
+        let identity = post.canonicalIdentity
+        return identity.hasPrefix("x:") ? identity : "id:\(sourceID)"
+    }
+
+    @MainActor private static func migrateDeliveredEvents(
+        previous: QuotaSnapshot?, delivery: NotificationDelivery
+    ) {
+        let defaults = delivery.defaults
+        guard defaults.object(forKey: NotificationDelivery.eventKey) == nil else { return }
+        var known = (defaults.stringArray(forKey: seenTiboPostsKey) ?? []).map { "tibo-post-\($0)" }
+        if let legacy = defaults.string(forKey: lastAnnouncementKey) {
+            known.append("reset-announced-\(canonicalAnnouncementIdentity(id: legacy))")
+        }
+        // The saved dashboard was already shown by the previous build. Seed
+        // it quietly on upgrade instead of announcing its contents again.
+        if let previous, let identity = canonicalAnnouncementIdentity(previous) {
+            known.append("reset-announced-\(identity)")
+        }
+        if let completion = defaults.string(forKey: lastCompletionKey) {
+            known.append("reset-completed-\(completion)")
+        }
+        delivery.remember(known)
     }
 
     static func tiboNotificationState(
@@ -289,8 +423,12 @@ enum NotificationManager {
         _ state: TiboNotificationState,
         defaults: UserDefaults
     ) {
-        defaults.set(state.identities, forKey: seenTiboPostsKey)
-        if let watermark = state.watermark {
+        var seen = Set<String>()
+        let identities = (state.identities + (defaults.stringArray(forKey: seenTiboPostsKey) ?? []))
+            .filter { seen.insert($0).inserted }
+        defaults.set(Array(identities.prefix(256)), forKey: seenTiboPostsKey)
+        let previousWatermark = defaults.double(forKey: tiboWatermarkKey)
+        if let watermark = state.watermark, watermark.timeIntervalSince1970 > previousWatermark {
             defaults.set(watermark.timeIntervalSince1970, forKey: tiboWatermarkKey)
         }
         if let newestIdentity = state.identities.first {
@@ -320,15 +458,11 @@ enum NotificationManager {
         )
     }
 
-    private static func add(_ content: UNNotificationContent, identifier: String) async {
-        try? await UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-        )
-    }
-
     static func didUsageReset(previous: QuotaSnapshot?, current: QuotaSnapshot) -> Bool {
         guard
             let previous,
+            previous.directCodexAccountID == current.directCodexAccountID,
+            current.codexNeedsConnection != true,
             previous.capturedAt < current.capturedAt,
             let oldUsage = previous.usagePercent,
             let newUsage = current.usagePercent,
@@ -366,8 +500,10 @@ enum NotificationManager {
         return confirmations.contains(where: text.contains)
     }
 
-    private static func wasResetCompletionRecentlyNotified(now: Date = Date()) -> Bool {
-        let timestamp = UserDefaults.standard.double(forKey: lastCompletionAtKey)
+    private static func wasResetCompletionRecentlyNotified(
+        now: Date = Date(), defaults: UserDefaults
+    ) -> Bool {
+        let timestamp = defaults.double(forKey: lastCompletionAtKey)
         guard timestamp > 0 else { return false }
         return now.timeIntervalSince1970 - timestamp < 6 * 60 * 60
     }

@@ -42,7 +42,7 @@ enum ResetAutomationSettings {
 
 enum ResetAutomationRunner {
     private static let logger = Logger(
-        subsystem: "com.drewdudney.quotaglance",
+        subsystem: "com.example.quotaglance",
         category: "ResetAutomation"
     )
 

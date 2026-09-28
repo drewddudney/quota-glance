@@ -233,6 +233,7 @@ struct QuotaTokenPace: Codable, Equatable, Sendable {
 struct QuotaUsageIntelligence: Codable, Equatable, Sendable {
     let apiEquivalentUSD: Double
     let quotaWeightedUSD: Double
+    let gpt6CodexCredits: Double?
     let pricingCoverage: Double
     let speedCoverage: Double
     let fastShare: Double
@@ -421,8 +422,15 @@ enum ResetAnnouncementTimeParser {
 }
 
 struct QuotaSnapshot: Codable, Equatable, Sendable {
+    var claude: ClaudeQuotaSnapshot? = nil
+    var directCodexAccountID: String? = nil
+    var codexNeedsConnection: Bool? = nil
+    var recentProviderActivity: [String: Date]? = nil
+    var usageUpdatedAt: Date? = nil
+    var usageMeasurementDate: Date { usageUpdatedAt ?? capturedAt }
     var capturedAt: Date
     var weekElapsedPercent: Double?
+    var calendarDeadlineAt: Date? = nil
     var usagePercent: Double?
     var resetChancePercent: Double?
     var resetAt: Date?
@@ -616,7 +624,7 @@ struct QuotaSnapshot: Codable, Equatable, Sendable {
     }
 
     func hasActiveCodexSession(at now: Date = Date()) -> Bool {
-        guard now.timeIntervalSince(capturedAt) <= 10 * 60 else { return false }
+        guard now.timeIntervalSince(usageMeasurementDate) <= 10 * 60 else { return false }
         // Recent token history lingers after a turn finishes. ActivityKit should only
         // remain visible while the Mac reports an actual running Codex task.
         return !(activeTasks ?? []).isEmpty
@@ -698,7 +706,7 @@ struct QuotaSnapshot: Codable, Equatable, Sendable {
 }
 
 enum SharedSnapshotStore {
-    static let appGroup = "group.com.drewdudney.quotaglance"
+    static let appGroup = "group.com.example.quotaglance"
     private static let snapshotKey = "QuotaGlance.mobile.snapshot.v1"
 
     static func load() -> QuotaSnapshot {

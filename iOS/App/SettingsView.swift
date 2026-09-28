@@ -3,111 +3,146 @@ import UserNotifications
 
 struct SettingsView: View {
     @ObservedObject var store: DashboardStore
-    @Binding var selectedTheme: MobileTheme
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var preferences = NotificationPreferences.load()
-    @State private var notificationStatus = "Checking…"
+    @State private var authorization: UNAuthorizationStatus = .notDetermined
+    @State private var connecting: DirectUsageProvider?
+    @State private var connectionRevision = 0
+    @AppStorage(PhoneSyncSettings.macDetailsKey) private var macDetails = false
+    @ObservedObject private var liveActivity = ProviderUsageActivityManager.shared
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Appearance") {
-                    Picker("Theme", selection: $selectedTheme) {
-                        ForEach(MobileTheme.allCases) { theme in
-                            Text(theme.rawValue).tag(theme)
+                Section {
+                    ForEach(DirectUsageProvider.allCases) { provider in
+                        Button { connecting = provider } label: {
+                            HStack(spacing: 12) {
+                                ProviderBrandMark(provider: provider == .codex ? .codex : .claude)
+                                    .fill(PhoneStyle.tint(provider == .codex ? .codex : .claude))
+                                    .frame(width: 20, height: 20)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(provider == .codex ? "OpenAI · Codex" : "Claude").foregroundStyle(PhoneStyle.ink)
+                                    Text(connectionLabel(provider)).font(.caption).foregroundStyle(PhoneStyle.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(PhoneStyle.secondary)
+                            }.padding(.vertical, 3)
+                        }
+                    }
+                } header: { Text("Accounts") } footer: {
+                    Text("Sign in here to fetch usage directly on your iPhone. Your Mac can be off.")
+                }
+                Section {
+                    Toggle("Follow active providers", isOn: Binding(
+                        get: { liveActivity.isEnabled },
+                        set: { enabled in Task { await liveActivity.setEnabled(enabled, snapshot: store.snapshot) } }
+                    ))
+                    NavigationLink("Pet animations") { PhonePetMotionSettings() }
+                    if let message = liveActivity.message { Text(message).font(.caption).foregroundStyle(.secondary) }
+                } header: { Text("Live Activity") } footer: {
+                    Text("Follows usage changes from the last six minutes. Background checks depend on iOS.")
+                }
+                if authorization != .authorized && authorization != .provisional && authorization != .ephemeral {
+                    Section {
+                        Button {
+                            Task {
+                                if authorization == .denied {
+                                    if let url = URL(string: UIApplication.openSettingsURLString) { await UIApplication.shared.open(url) }
+                                } else { _ = await NotificationManager.requestAuthorization() }
+                                await refreshAuthorization()
+                            }
+                        } label: {
+                            Label(authorization == .denied ? "Allow notifications in Settings" : "Enable notifications", systemImage: "bell.badge")
                         }
                     }
                 }
-
-                Section("Reset calculator") {
-                    ForEach(ResetSource.calculatorCases) { source in
-                        Toggle(source.name, isOn: store.binding(for: source))
-                    }
-                    Text("The reset dial averages the checked calculators that currently publish a percentage.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section {
-                    Toggle("Reset announced", isOn: $preferences.resetAnnounced)
-                    Toggle("Reset completed", isOn: $preferences.resetCompleted)
-                    if preferences.resetAnnounced || preferences.resetCompleted {
-                        Toggle("Emergency-style reset alert", isOn: $preferences.prominentResetAlert)
-                        Text(preferences.prominentResetAlert
-                             ? "Time Sensitive, with the reset sound, a high-visibility in-app banner, and a Live Activity countdown. It may break through Focus, but uses no government emergency-alert channel."
-                             : "Delivered as a normal notification with a Live Activity countdown.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Toggle("Approaching usage limit", isOn: $preferences.usageApproachingLimit)
-                    if preferences.usageApproachingLimit {
-                        Picker("Warn me at", selection: $preferences.usageThreshold) {
+                Section("Notifications") {
+                    Toggle("Codex usage limit", isOn: $preferences.usageApproachingLimit)
+                    Toggle("Claude usage limits", isOn: $preferences.claudeUsage)
+                    if preferences.usageApproachingLimit || preferences.claudeUsage {
+                        Picker("Warn at", selection: $preferences.usageThreshold) {
                             Text("80%").tag(80.0)
                             Text("90%").tag(90.0)
                             Text("95%").tag(95.0)
+                            if ![80.0, 90.0, 95.0].contains(preferences.usageThreshold) {
+                                Text("\(Int(preferences.usageThreshold))%").tag(preferences.usageThreshold)
+                            }
                         }
                     }
-
-                    Toggle("Renewal in 3 days", isOn: $preferences.renewalSoon)
-                    Toggle("Reset credit expiring", isOn: $preferences.resetCreditExpiring)
-                    Toggle("Likely to run out early", isOn: $preferences.paceRisk)
-                    Toggle("New Tibo posts", isOn: $preferences.tiboPosts)
-                    Toggle("Codex task changes", isOn: $preferences.codexTasks)
-                    Toggle("Live Codex session", isOn: $preferences.sessionLiveActivity)
-                    Toggle("Mac sync is stale", isOn: $preferences.staleSync)
-                } header: {
-                    Text("Notifications")
-                } footer: {
-                    Text("Live Codex session shows usage and token burn on your Lock Screen while the Mac detects active work. Delivery timing is managed by iOS.")
+                    Toggle("Codex resets", isOn: Binding(
+                        get: { preferences.resetAnnounced || preferences.resetCompleted },
+                        set: { preferences.resetAnnounced = $0; preferences.resetCompleted = $0 }
+                    ))
+                    Toggle("Tibo’s updates", isOn: $preferences.tiboPosts)
+                    NavigationLink("Activity & more alerts") { additionalAlerts }
                 }
-
-                Section("Permission") {
-                    HStack {
-                        Text("Notifications")
-                        Spacer()
-                        Text(notificationStatus).foregroundStyle(.secondary)
-                    }
-                    Button("Enable notifications") {
-                        Task {
-                            _ = await NotificationManager.requestAuthorization()
-                            await refreshAuthorizationStatus()
-                        }
-                    }
-                }
-
-                Section("Sync") {
-                    LabeledContent("Codex usage", value: "Private iCloud")
-                    LabeledContent("Reset sources", value: "Direct")
-                    Text("Usage and billing dates come from your Mac. Public reset estimates refresh directly on the phone.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                Section {
+                    Toggle("Include Mac history & tasks", isOn: $macDetails)
+                } header: { Text("Optional") } footer: {
+                    Text("Adds local token totals and task details through iCloud. Phone connections stay in charge of usage.")
                 }
             }
-            .navigationTitle("Quota Glance")
+            .font(.system(size: 15))
+            .scrollContentBackground(.hidden)
+            .background(PhoneStyle.paper)
+            .tint(PhoneStyle.reset)
+            .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
-            .task { await refreshAuthorizationStatus() }
-            .onChange(of: preferences.resetAnnounced) { preferences.save() }
-            .onChange(of: preferences.resetCompleted) { preferences.save() }
-            .onChange(of: preferences.prominentResetAlert) { preferences.save() }
-            .onChange(of: preferences.usageApproachingLimit) { preferences.save() }
-            .onChange(of: preferences.usageThreshold) { preferences.save() }
-            .onChange(of: preferences.renewalSoon) { preferences.save() }
-            .onChange(of: preferences.resetCreditExpiring) { preferences.save() }
-            .onChange(of: preferences.paceRisk) { preferences.save() }
-            .onChange(of: preferences.tiboPosts) { preferences.save() }
-            .onChange(of: preferences.codexTasks) { preferences.save() }
-            .onChange(of: preferences.sessionLiveActivity) { preferences.save() }
-            .onChange(of: preferences.staleSync) { preferences.save() }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .sheet(item: $connecting) { ProviderConnectionView(provider: $0) }
+            .onReceive(NotificationCenter.default.publisher(for: .directProviderUsageChanged)) { _ in connectionRevision += 1 }
+            .onChange(of: macDetails) {
+                Task {
+                    if macDetails { await CloudSnapshotService.installSubscriptionIfNeeded() }
+                    await store.refresh()
+                }
+            }
+            .task { await refreshAuthorization() }
+            .onChange(of: scenePhase) { if scenePhase == .active { Task { await refreshAuthorization() } } }
+            .onChange(of: preferences) {
+                preferences.save()
+                Task { await CodexSessionLiveActivityManager.shared.sync(with: store.snapshot, preferences: preferences) }
+            }
         }
     }
 
-    private func refreshAuthorizationStatus() async {
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        notificationStatus = switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral: "Enabled"
-        case .denied: "Disabled"
-        case .notDetermined: "Not enabled"
-        @unknown default: "Unknown"
+    private var additionalAlerts: some View {
+        Form {
+            Section("Claude") { Toggle("New weekly allowance", isOn: $preferences.claudeWeek) }
+            Section("Codex resets") {
+                Toggle("Reset announced", isOn: $preferences.resetAnnounced)
+                Toggle("Reset confirmed", isOn: $preferences.resetCompleted)
+                Toggle("Time Sensitive alerts", isOn: $preferences.prominentResetAlert)
+                Toggle("Reset credit expiring", isOn: $preferences.resetCreditExpiring)
+            }
+            Section("Codex activity") {
+                Toggle("Running out early", isOn: $preferences.paceRisk)
+                if macDetails {
+                    Toggle("Subscription renewal", isOn: $preferences.renewalSoon)
+                    Toggle("Task changes", isOn: $preferences.codexTasks)
+                    Toggle("Mac task Live Activity", isOn: $preferences.sessionLiveActivity)
+                }
+                Toggle("Usage out of date", isOn: $preferences.staleSync)
+            }
+            Section { Button("iPhone notification settings") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } } }
         }
+        .font(.system(size: 15))
+            .scrollContentBackground(.hidden)
+        .background(PhoneStyle.paper)
+        .navigationTitle("More alerts")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func refreshAuthorization() async {
+        authorization = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    private func connectionLabel(_ provider: DirectUsageProvider) -> String {
+        _ = connectionRevision
+        let service = ProviderConnectionService.shared
+        if service.needsSignIn(provider) { return "Sign in again" }
+        return service.hasConnection(provider) ? "Connected on this iPhone" : "Connect account"
     }
 }

@@ -46,7 +46,7 @@ struct ResetClockStarterCommand {
 
 enum ResetClockStarter {
     private static let logger = Logger(
-        subsystem: "com.drewdudney.quotaglance",
+        subsystem: "com.example.quotaglance",
         category: "ResetClockStarter"
     )
     private static let retryInterval: TimeInterval = 15 * 60
@@ -147,6 +147,7 @@ enum ResetClockStarter {
 
     private static func codexExecutable() -> URL? {
         let candidates = [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "/opt/homebrew/bin/codex",

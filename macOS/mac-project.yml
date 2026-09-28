@@ -1,13 +1,12 @@
 name: QuotaGlanceMac
 options:
-  bundleIdPrefix: com.drewdudney
+  bundleIdPrefix: com.example
   deploymentTarget:
     macOS: "13.0"
 settings:
   base:
-    DEVELOPMENT_TEAM: 5DYDN5X5T2
     SWIFT_VERSION: 5.0
-    CURRENT_PROJECT_VERSION: 27
+    CURRENT_PROJECT_VERSION: 49
     MARKETING_VERSION: 1.0
     CODE_SIGN_STYLE: Automatic
 targets:
@@ -18,18 +17,26 @@ targets:
       - Sources/QuotaGlance
       - path: Resources/AppIcon.icns
         buildPhase: resources
+      - path: Resources/CodexPet.webp
+        buildPhase: resources
+      - path: Resources/ClawdIdle.png
+        buildPhase: resources
+      - path: Resources/ClawdWink.png
+        buildPhase: resources
+      - path: Resources/ClawdWave.png
+        buildPhase: resources
     entitlements:
       path: QuotaGlance.entitlements
       properties:
         com.apple.developer.icloud-container-identifiers:
-          - iCloud.com.drewdudney.quotaglance
+          - iCloud.com.example.quotaglance
         com.apple.developer.icloud-services:
           - CloudKit
         com.apple.developer.icloud-container-environment: Production
-        com.apple.developer.ubiquity-kvstore-identifier: 5DYDN5X5T2.com.drewdudney.quotaglance
+        com.apple.developer.ubiquity-kvstore-identifier: $(TeamIdentifierPrefix)com.example.quotaglance
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.drewdudney.quotaglance
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.quotaglance
         PRODUCT_NAME: Quota Glance
         EXECUTABLE_NAME: QuotaGlance
         GENERATE_INFOPLIST_FILE: NO

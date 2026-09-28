@@ -47,6 +47,9 @@ struct MenuBarSummaryPayload: Sendable {
     let lastSuccessfulAt: Date?
     let lastAttemptFailed: Bool
     let statusMessage: String
+    var calendarDeadlineAt: Date? = nil
+    var newTweet: TiboTweet? = nil
+    var tweets: [TiboTweet] = []
 }
 
 @MainActor
@@ -72,6 +75,8 @@ final class MenuBarSummaryModel: ObservableObject {
     )
 
     private init() {}
+
+    var onClearTweet: (() -> Void)?
 
     func update(_ payload: MenuBarSummaryPayload) {
         self.payload = payload
@@ -142,209 +147,4 @@ final class MenuBarSummaryModel: ObservableObject {
 
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
-}
-
-struct MenuBarSummaryPopover: View {
-    @ObservedObject var summary: MenuBarSummaryModel
-    @AppStorage(WidgetTheme.defaultsKey) private var themeRawValue = WidgetTheme.current.rawValue
-    let onOpenWidget: () -> Void
-    let onOpenTweets: () -> Void
-    let onRefresh: () -> Void
-
-    private var theme: WidgetTheme { WidgetTheme(rawValue: themeRawValue) ?? .current }
-    private var palette: PopoverPalette { theme.popoverPalette }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            header
-
-            if let short = summary.shortWindow {
-                quotaRow(short, title: short.durationMinutes == 300 ? "5-HOUR" : "SESSION")
-            }
-            if let weekly = summary.weeklyWindow {
-                quotaRow(weekly, title: "WEEKLY")
-            }
-
-            if summary.payload.primary == nil {
-                Text(summary.payload.statusMessage)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(palette.secondary)
-                    .padding(.vertical, 12)
-            }
-
-            if summary.payload.paceHeadline != nil || summary.payload.paceRunout != nil {
-                paceRow
-            }
-
-            resetSignalRow
-            actions
-        }
-        .padding(16)
-        .frame(width: 386)
-        .background(palette.background)
-        .preferredColorScheme(theme.isLight ? .light : .dark)
-    }
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            Text(">_")
-                .font(.system(size: 15, weight: .bold, design: .monospaced))
-                .foregroundStyle(palette.pace)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("CODEX · \(summary.payload.planName.uppercased())")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(palette.primary)
-                Text(updatedText)
-                    .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(palette.tertiary)
-            }
-            Spacer()
-            HStack(spacing: 5) {
-                Circle().fill(freshnessColor).frame(width: 6, height: 6)
-                Text(summary.freshness.rawValue.uppercased())
-            }
-            .font(.system(size: 8, weight: .bold, design: .monospaced))
-            .foregroundStyle(freshnessColor)
-        }
-    }
-
-    private func quotaRow(_ window: MenuBarQuotaWindow, title: String) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                Spacer()
-                Text("\(Int(window.usedPercent.rounded()))%")
-                    .font(.system(size: 16, weight: .semibold, design: .monospaced))
-            }
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(palette.rule)
-                    Capsule()
-                        .fill(palette.pace)
-                        .frame(width: proxy.size.width * min(1, max(0, window.usedPercent / 100)))
-                }
-            }
-            .frame(height: 6)
-            HStack {
-                Text("\(Int(window.usedPercent.rounded()))% USED")
-                Spacer()
-                TimelineView(.periodic(from: .now, by: 30)) { context in
-                    Text(window.resetAt > context.date
-                         ? "RESETS IN \(MenuBarSummaryModel.shortCountdown(to: window.resetAt, from: context.date))"
-                         : "RESET DUE")
-                }
-            }
-            .font(.system(size: 8, weight: .bold, design: .monospaced))
-            .foregroundStyle(palette.tertiary)
-        }
-        .padding(11)
-        .background(RoundedRectangle(cornerRadius: 10).fill(palette.surface))
-    }
-
-    private var paceRow: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "chart.line.uptrend.xyaxis")
-                .foregroundStyle(palette.pace)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(summary.payload.paceHeadline?.uppercased() ?? "PACE")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                if let runout = summary.payload.paceRunout {
-                    Text("TO EMPTY · \(runout.uppercased())")
-                        .font(.system(size: 9, weight: .semibold, design: .rounded))
-                        .foregroundStyle(palette.secondary)
-                }
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 11)
-    }
-
-    private var resetSignalRow: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(palette.reset)
-                Text("RESET SIGNAL")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                Spacer()
-                Text("\(Int((summary.payload.forecastPercent ?? 0).rounded()))%")
-                    .font(.system(size: 16, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(palette.reset)
-            }
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(palette.rule)
-                    Capsule().fill(palette.reset)
-                        .frame(width: proxy.size.width * min(1, max(0, (summary.payload.forecastPercent ?? 0) / 100)))
-                }
-            }
-            .frame(height: 5)
-            HStack(spacing: 8) {
-                if let expected = summary.payload.expectedResetAt {
-                    TimelineView(.periodic(from: .now, by: 30)) { context in
-                        Text(summary.payload.resetIsDelayed
-                             ? "RESET DELAYED"
-                             : "↻ \(MenuBarSummaryModel.shortCountdown(to: expected, from: context.date))")
-                    }
-                } else if let range = summary.payload.forecastRange {
-                    Text("NEXT 24H · \(range)")
-                } else {
-                    Text("NEXT 24H")
-                }
-                Spacer()
-                if let blessing = summary.payload.lastBlessingAt {
-                    Text("🙏 \(age(blessing))")
-                }
-                if summary.payload.unreadTweet {
-                    Image(systemName: "text.bubble.fill").foregroundStyle(Color(hex: 0x58B9F3))
-                }
-            }
-            .font(.system(size: 8, weight: .bold, design: .monospaced))
-            .foregroundStyle(palette.tertiary)
-        }
-        .padding(11)
-        .background(RoundedRectangle(cornerRadius: 10).fill(palette.surface))
-    }
-
-    private var actions: some View {
-        HStack(spacing: 8) {
-            actionButton("Open Widget", icon: "dial.medium", action: onOpenWidget)
-            actionButton("Tweets", icon: "text.bubble", action: onOpenTweets)
-            actionButton("Refresh", icon: "arrow.clockwise", action: onRefresh)
-        }
-    }
-
-    private func actionButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: icon)
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 7)
-                .background(RoundedRectangle(cornerRadius: 8).fill(palette.raisedSurface))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var freshnessColor: Color {
-        switch summary.freshness {
-        case .live: palette.reset
-        case .stale: palette.billing
-        case .offline: Color.red.opacity(0.82)
-        }
-    }
-
-    private var updatedText: String {
-        guard let date = summary.payload.lastSuccessfulAt else { return "WAITING FOR LIVE DATA" }
-        return "UPDATED \(age(date)) AGO"
-    }
-
-    private func age(_ date: Date) -> String {
-        let seconds = max(0, Date().timeIntervalSince(date))
-        if seconds < 60 { return "NOW" }
-        if seconds < 3_600 { return "\(Int(seconds / 60))M" }
-        if seconds < 86_400 { return "\(Int(seconds / 3_600))H" }
-        return "\(Int(seconds / 86_400))D"
-    }
 }

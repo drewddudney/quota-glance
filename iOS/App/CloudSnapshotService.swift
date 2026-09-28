@@ -3,7 +3,7 @@ import ActivityKit
 import Foundation
 
 enum CloudSnapshotService {
-    static let containerIdentifier = "iCloud.com.drewdudney.quotaglance"
+    static let containerIdentifier = "iCloud.com.example.quotaglance"
     static let recordType = "QuotaGlanceSnapshot"
     static let recordID = CKRecord.ID(recordName: "current-v1")
     static let keyValueSnapshotKey = "QuotaGlance.snapshot.v1"

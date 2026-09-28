@@ -26,6 +26,7 @@ struct MobileTokenPace: Codable, Sendable {
 struct MobileUsageIntelligence: Codable, Sendable {
     let apiEquivalentUSD: Double
     let quotaWeightedUSD: Double
+    let gpt6CodexCredits: Double?
     let pricingCoverage: Double
     let speedCoverage: Double
     let fastShare: Double
@@ -107,6 +108,8 @@ struct MobileTiboPost: Codable, Sendable {
 }
 
 struct MobileQuotaSnapshot: Codable, Sendable {
+    var claude: ClaudeQuotaSnapshot? = nil
+    var usageUpdatedAt: Date? = nil
     let capturedAt: Date
     let weekElapsedPercent: Double?
     let usagePercent: Double?
@@ -150,11 +153,11 @@ struct MobileQuotaSnapshot: Codable, Sendable {
 actor MobileSnapshotPublisher {
     static let shared = MobileSnapshotPublisher()
 
-    private static let containerIdentifier = "iCloud.com.drewdudney.quotaglance"
+    private static let containerIdentifier = "iCloud.com.example.quotaglance"
     private static let keyValueSnapshotKey = "QuotaGlance.snapshot.v1"
     private static let recordType = "QuotaGlanceSnapshot"
     private static let recordID = CKRecord.ID(recordName: "current-v1")
-    private static let logger = Logger(subsystem: "com.drewdudney.quotaglance", category: "PhoneSync")
+    private static let logger = Logger(subsystem: "com.example.quotaglance", category: "PhoneSync")
     private static let lastAttemptKey = "mobileSnapshotLastAttemptAt"
     private static let lastSuccessKey = "mobileSnapshotLastSuccessAt"
     private static let lastErrorKey = "mobileSnapshotLastError"

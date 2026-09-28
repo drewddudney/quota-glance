@@ -49,6 +49,14 @@ final class DashboardStore: ObservableObject {
     private static let sourceKey = "QuotaGlance.mobile.resetSource"
     private static let sourcesKey = "QuotaGlance.mobile.resetSources"
     private var isRefreshing = false
+    static var isPreview: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("--quota-preview")
+#else
+        false
+#endif
+    }
+
     private var hasStarted = false
 
     init() {
@@ -56,6 +64,9 @@ final class DashboardStore: ObservableObject {
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--quota-preview") {
             snapshot = Self.previewSnapshot()
+            if ProcessInfo.processInfo.arguments.contains("--quota-preview-live-system") {
+                snapshot.recentProviderActivity = ["codex": .now, "claude": .now]
+            }
         }
 #endif
     }
@@ -74,7 +85,18 @@ final class DashboardStore: ObservableObject {
                 tokens: Int64(34_000 + tokenFraction * 37_200)
             )
         }
+        var claude = ClaudeQuotaSnapshot(capturedAt: now, usagePercent: 82, resetAt: resetAt,
+            planName: "Max", accountID: "preview", verified: true, needsConnection: false,
+            fiveHourUsagePercent: 31, fiveHourResetAt: now.addingTimeInterval(2 * 3_600),
+            usageHistory: samples.map { .init(date: $0.date, usedPercent: 49 + ($0.usedPercent - 34) / 37 * 33) },
+            weeklyArchives: [.init(windowStart: windowStart.addingTimeInterval(-7 * 86_400), resetAt: windowStart,
+                finalUsedPercent: 82, points: samples.map {
+                    .init(date: $0.date.addingTimeInterval(-7 * 86_400), usedPercent: 49 + ($0.usedPercent - 34) / 37 * 33)
+                })])
+        claude.estimatedRunoutAt = ClaudeUsageHistory.estimate(for: claude, now: now)
+        claude.paceWindowLabel = "recorded one-hour"
         return QuotaSnapshot(
+            claude: claude,
             capturedAt: now,
             weekElapsedPercent: 86,
             usagePercent: 71,
@@ -108,6 +130,7 @@ final class DashboardStore: ObservableObject {
             usageIntelligence: .init(
                 apiEquivalentUSD: 18.42,
                 quotaWeightedUSD: 31.08,
+                gpt6CodexCredits: 2_480,
                 pricingCoverage: 0.98,
                 speedCoverage: 0.91,
                 fastShare: 0.37,
@@ -161,23 +184,27 @@ final class DashboardStore: ObservableObject {
 #endif
 
     func start() async {
-        guard !hasStarted else { return }
+        guard !Self.isPreview else { return }
+        guard !hasStarted else { await refresh(); return }
         hasStarted = true
         await LiveActivityPushTokenPublisher.shared.start()
-        await CloudSnapshotService.installSubscriptionIfNeeded()
+        if PhoneSyncSettings.includesMacDetails { await CloudSnapshotService.installSubscriptionIfNeeded() }
         await refresh()
     }
 
     func refresh() async {
+        guard !Self.isPreview else { return }
         guard !isRefreshing else { return }
         isRefreshing = true
         state = .syncing
         defer { isRefreshing = false }
 
+        async let directResult = ProviderConnectionService.shared.refreshAll()
         async let cloudResult = cloudSnapshot()
         async let publicResult = try? ResetProviderService.fetch(selected: selectedSources)
         let cloud = await cloudResult
         let forecast = await publicResult
+        _ = await directResult
 
         let previousSnapshot = snapshot
         var merged = cloud ?? snapshot
@@ -199,6 +226,7 @@ final class DashboardStore: ObservableObject {
             merged.lastBlessingAt = forecast.lastBlessingAt
             merged.tiboPosts = Self.mergePosts(forecast.tiboPosts, merged.tiboPosts ?? [])
         }
+        merged = Self.withPhoneUsage(merged, previous: previousSnapshot)
         merged.applyResetApplicabilityResponse(ResetApplicability.load())
         if let resetAt = merged.resetAt {
             let start = resetAt.addingTimeInterval(-7 * 86_400)
@@ -210,25 +238,33 @@ final class DashboardStore: ObservableObject {
         WidgetCenter.shared.reloadAllTimelines()
         await ResetLiveActivityManager.shared.sync(with: merged)
         await CodexSessionLiveActivityManager.shared.sync(with: merged)
+        await ProviderUsageActivityManager.shared.sync(snapshot: merged)
+        PhonePetCelebrationCoordinator.shared.observe(previous: previousSnapshot, current: merged)
         await NotificationManager.evaluate(merged, previous: previousSnapshot, preferences: .load())
-        state = cloud == nil && forecast == nil
-            ? .partial("Cached")
-            : (cloud == nil ? .partial("Reset data live · Mac pending") : .current)
+        state = Self.syncState(for: merged)
         AppDelegate.scheduleRefresh()
     }
 
-    /// KVS notifications are the primary foreground path. This modest polling
-    /// loop is only a reliability fallback for missed notifications.
+    /// Phone sessions refresh independently; optional Mac details use their
+    /// existing inexpensive iCloud notification path.
     func runForegroundSyncLoop() async {
+        guard !Self.isPreview else { return }
         var nextCloudFallback = Date().addingTimeInterval(
             Self.ForegroundSyncPolicy.cloudFallbackInterval
         )
+        var nextDirectRefresh = Date().addingTimeInterval(120)
         while !Task.isCancelled {
+            if Date() >= nextDirectRefresh {
+                _ = await ProviderConnectionService.shared.refreshAll()
+                await refreshPhoneUsage()
+                nextDirectRefresh = Date().addingTimeInterval(120)
+            }
             await refreshCloudSnapshotIfNew()
+            await ProviderUsageActivityManager.shared.sync(snapshot: snapshot)
             try? await Task.sleep(for: Self.ForegroundSyncPolicy.localPollInterval)
             guard !Task.isCancelled else { return }
             if Date() >= nextCloudFallback {
-                await refreshCloudSnapshotIfNew(useCloudKitFallback: true)
+                await refresh()
                 nextCloudFallback = Date().addingTimeInterval(
                     Self.ForegroundSyncPolicy.cloudFallbackInterval
                 )
@@ -239,6 +275,7 @@ final class DashboardStore: ObservableObject {
     /// Applies work already completed by a background refresh without
     /// immediately repeating its CloudKit and public-provider requests.
     func refreshFromSharedSnapshotIfNew() async {
+        guard !Self.isPreview else { return }
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
@@ -248,6 +285,7 @@ final class DashboardStore: ObservableObject {
     }
 
     func refreshCloudSnapshotIfNew(useCloudKitFallback: Bool = false) async {
+        guard !Self.isPreview, PhoneSyncSettings.includesMacDetails else { return }
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
@@ -264,7 +302,7 @@ final class DashboardStore: ObservableObject {
 
     private func applyIncomingSnapshot(_ value: QuotaSnapshot) async {
         let previousSnapshot = snapshot
-        var incoming = value
+        var incoming = Self.withPhoneUsage(value, previous: previousSnapshot)
         incoming.applyResetApplicabilityResponse(ResetApplicability.load())
         incoming.selectedSources = ResetSource.calculatorCases.filter(selectedSources.contains)
         incoming.selectedSource = selectedSources.count == 1 ? selectedSources.first! : .average
@@ -275,11 +313,13 @@ final class DashboardStore: ObservableObject {
         guard incoming != previousSnapshot else { return }
 
         snapshot = incoming
-        state = .current
+        state = Self.syncState(for: incoming)
         SharedSnapshotStore.save(incoming)
         WidgetCenter.shared.reloadAllTimelines()
         await ResetLiveActivityManager.shared.sync(with: incoming)
         await CodexSessionLiveActivityManager.shared.sync(with: incoming)
+        await ProviderUsageActivityManager.shared.sync(snapshot: incoming)
+        PhonePetCelebrationCoordinator.shared.observe(previous: previousSnapshot, current: incoming)
         await NotificationManager.evaluate(incoming, previous: previousSnapshot, preferences: .load())
     }
 
@@ -295,6 +335,7 @@ final class DashboardStore: ObservableObject {
     }
 
     func refreshResetApplicabilityFromCloud() async {
+        guard !Self.isPreview else { return }
         let previous = snapshot
         snapshot.applyResetApplicabilityResponse(ResetApplicability.load())
         guard snapshot != previous else { return }
@@ -304,7 +345,43 @@ final class DashboardStore: ObservableObject {
     }
 
     private func cloudSnapshot() async -> QuotaSnapshot? {
-        try? await CloudSnapshotService.fetch()
+        guard PhoneSyncSettings.includesMacDetails else { return nil }
+        return try? await CloudSnapshotService.fetch()
+    }
+
+    func refreshPhoneUsage() async {
+        guard !Self.isPreview, !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        await applyIncomingSnapshot(snapshot)
+    }
+
+    static func withPhoneUsage(_ value: QuotaSnapshot, previous: QuotaSnapshot) -> QuotaSnapshot {
+        let service = ProviderConnectionService.shared
+        var result = PhoneUsageMerge.merge(
+            base: value, previous: previous,
+            readings: DirectUsageProvider.allCases.compactMap { service.latestUsage(for: $0) },
+            connections: Set(DirectUsageProvider.allCases.filter { service.hasConnection($0) }),
+            needsConnection: Set(DirectUsageProvider.allCases.filter { service.needsSignIn($0) }),
+            includeMacDetails: PhoneSyncSettings.includesMacDetails
+        )
+        result.recentProviderActivity = ProviderActivityDetector.activity(previous: previous, current: result)
+        return result
+    }
+
+    private static func syncState(for value: QuotaSnapshot) -> SyncState {
+        let service = ProviderConnectionService.shared
+        let selected = MobileProviderSelection.current.providers
+        let allFresh = selected.allSatisfy { provider in
+            let reading = MobileProviderReading(provider: provider, snapshot: value, at: Date())
+            guard let measuredAt = reading.capturedAt else { return false }
+            return !reading.needsConnection && Date().timeIntervalSince(measuredAt) <= 15 * 60
+        }
+        if allFresh { return .current }
+        if selected.contains(where: { !service.hasConnection($0 == .codex ? .codex : .claude) }), !PhoneSyncSettings.includesMacDetails {
+            return .partial("Connect accounts in Settings")
+        }
+        return .partial("Saved usage")
     }
 
     func binding(for source: ResetSource) -> Binding<Bool> {
@@ -357,9 +434,9 @@ final class DashboardStore: ObservableObject {
 }
 
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    static let refreshIdentifier = "com.drewdudney.quotaglance.refresh"
+    static let refreshIdentifier = "com.example.quotaglance.refresh"
     private static let logger = Logger(
-        subsystem: "com.drewdudney.quotaglance.mobile",
+        subsystem: "com.example.quotaglance.mobile",
         category: "BackgroundRefresh"
     )
 
@@ -433,11 +510,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             ? (legacy == .average ? Set(ResetSource.calculatorCases) : [legacy])
             : decodedSources
 
-        async let cloudRequest: QuotaSnapshot? = try? CloudSnapshotService.fetch()
+        async let directRequest = ProviderConnectionService.shared.refreshAll(inBackground: true)
+        async let cloudRequest: QuotaSnapshot? = PhoneSyncSettings.includesMacDetails ? try? CloudSnapshotService.fetch() : nil
         async let forecastRequest = try? ResetProviderService.fetch(selected: selected)
-        let (cloud, forecast) = await (cloudRequest, forecastRequest)
+        let (cloud, forecast, direct) = await (cloudRequest, forecastRequest, directRequest)
 
-        guard cloud != nil || forecast != nil else {
+        guard cloud != nil || forecast != nil || !direct.isEmpty else {
             logger.error("Background refresh failed (\(reason, privacy: .public)): no source returned data")
             return .failed
         }
@@ -461,6 +539,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             snapshot.lastBlessingAt = forecast.lastBlessingAt
             snapshot.tiboPosts = DashboardStore.mergePosts(forecast.tiboPosts, snapshot.tiboPosts ?? [])
         }
+        snapshot = DashboardStore.withPhoneUsage(snapshot, previous: previous)
         snapshot.applyResetApplicabilityResponse(ResetApplicability.load())
         if let resetAt = snapshot.resetAt {
             let start = resetAt.addingTimeInterval(-7 * 86_400)
@@ -473,6 +552,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             WidgetCenter.shared.reloadAllTimelines()
             await ResetLiveActivityManager.shared.sync(with: snapshot)
             await CodexSessionLiveActivityManager.shared.sync(with: snapshot)
+            await ProviderUsageActivityManager.shared.sync(snapshot: snapshot)
             await NotificationManager.evaluate(snapshot, previous: previous, preferences: .load())
             if UIApplication.shared.applicationState == .active {
                 NotificationCenter.default.post(name: .quotaCloudChanged, object: nil)
@@ -549,6 +629,8 @@ actor CodexSessionLiveActivityManager {
         let activities = Activity<CodexSessionActivityAttributes>.activities
         guard
             preferences.sessionLiveActivity,
+            PhoneSyncSettings.includesMacDetails,
+            !PhoneSyncSettings.automaticUsageEnabled,
             ActivityAuthorizationInfo().areActivitiesEnabled,
             snapshot.hasActiveCodexSession(at: now)
         else {
@@ -581,7 +663,7 @@ actor CodexSessionLiveActivityManager {
             totalTokens: snapshot.bestTokenTotal ?? 0,
             tokensPerMinute: perMinute,
             percentPerMinute: percentPerMinute,
-            updatedAt: snapshot.capturedAt
+            updatedAt: snapshot.usageMeasurementDate
         )
         let content = ActivityContent(state: state, staleDate: now.addingTimeInterval(10 * 60))
 

@@ -2,6 +2,81 @@ import XCTest
 @testable import QuotaGlance
 
 final class ForecastSelectionTests: XCTestCase {
+    func testPolymarketDiscoveryUsesOpenEventAndItsCurrentURL() throws {
+        let market: [String: Any] = ["active": true, "closed": false, "endDate": "2030-01-02T00:00:00Z", "outcomes": "[\"Yes\",\"No\"]", "outcomePrices": "[\"0.45\",\"0.55\"]"]
+        let open: [String: Any] = ["slug": "openai-resets-codex-weekly-usage-limit-by-20260914", "active": true, "closed": false, "markets": [market]]
+        var closed = open
+        closed["closed"] = true
+        closed["startDate"] = "2031-01-01"
+        let data = try JSONSerialization.data(withJSONObject: ["events": [closed, open]])
+        let result = try ForecastService.polymarketSearchProvider(from: data, now: Date(timeIntervalSince1970: 1_800_000_000))
+        XCTAssertEqual(result.score, 45)
+        XCTAssertEqual(result.polymarketForecast?.url.absoluteString, "https://polymarket.com/event/openai-resets-codex-weekly-usage-limit-by-20260914")
+        XCTAssertNil(result.announcement)
+    }
+
+    func testPolymarketCurveKeepsEveryValidFutureDeadlineInOrder() throws {
+        func market(_ day: String, _ yes: String, _ no: String, closed: Bool = false) -> [String: Any] {
+            ["active": true, "closed": closed, "endDate": "2030-01-\(day)T00:00:00Z",
+             "groupItemTitle": "January \(day)", "outcomes": "[\"No\",\"Yes\"]",
+             "outcomePrices": "[\"\(no)\",\"\(yes)\"]"]
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "markets": [
+                market("04", "0.8", "0.2"), market("02", "0.45", "0.55"),
+                market("03", "0.4", "0.6"), // Independent markets may disagree; preserve real odds.
+                market("05", "1.2", "-0.2"), market("06", "NaN", "0.5"),
+                market("07", "0.9", "0.1", closed: true), market("01", "0.1", "0.9")
+            ]
+        ])
+        let now = ISO8601DateFormatter().date(from: "2030-01-01T12:00:00Z")!
+        let result = try ForecastService.polymarketProvider(from: data, now: now)
+        let points = try XCTUnwrap(result.polymarketForecast).points
+        XCTAssertEqual(points.map(\.marketLabel), ["January 02", "January 03", "January 04"])
+        XCTAssertEqual(points.map(\.yesPrice), [0.45, 0.4, 0.8])
+        XCTAssertEqual(points.map(\.noPrice), [0.55, 0.6, 0.2])
+        XCTAssertEqual(points.first?.axisLabel, "Jan 02")
+        XCTAssertEqual(result.score, 45)
+        XCTAssertEqual(result.forecastDeadline, points.first?.deadline)
+        XCTAssertNil(result.announcement)
+    }
+
+    func testPolymarketMatchesDisplayedProbabilityForWideAndTightBooks() throws {
+        let rows: [(String, Double, Double, Double, String)] = [
+            ("02", 0.21, 0.69, 0.21, "0.45"),
+            ("03", 0.40, 0.83, 0.40, "0.615"),
+            ("04", 0.86, 0.89, 0.90, "0.875"),
+            ("05", 0.40, 0.50, 0.30, "0.45")
+        ]
+        let markets: [[String: Any]] = rows.map { day, bid, ask, last, midpoint in
+            ["endDate": "2030-01-\(day)T00:00:00Z",
+             "outcomes": "[\"Yes\",\"No\"]", "outcomePrices": "[\"\(midpoint)\",\"0.5\"]",
+             "bestBid": bid, "bestAsk": ask, "lastTradePrice": last]
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["markets": markets])
+        let result = try ForecastService.polymarketProvider(from: data, now: Date(timeIntervalSince1970: 1_800_000_000))
+        let points = try XCTUnwrap(result.polymarketForecast).points
+        XCTAssertEqual(points.map(\.yesPrice), [0.21, 0.40, 0.875, 0.45])
+        XCTAssertEqual(points.map(\.usesLastTrade), [true, true, false, false])
+        XCTAssertEqual(result.score, 21)
+    }
+
+    func testWillFlagCannotPromoteGenericResetTalkToAnnouncement() {
+        let post = TiboTweet(id: "test", date: Date(), text: "I know you all want a reset", inReplyTo: nil, url: nil)
+        XCTAssertNil(ForecastService.announcementFromTweets([post], source: .willCodexQuotaReset, explicitlyAnnounced: true))
+        XCTAssertTrue(ForecastService.isExplicitResetAnnouncement("We're resetting usage limits today"))
+        XCTAssertFalse(ForecastService.isExplicitResetAnnouncement("We're not resetting usage limits today"))
+    }
+
+    func testRestoredProviderSelectionIsPreserved() {
+        let defaults = UserDefaults(suiteName: "RemovedProvider-\(UUID().uuidString)")!
+        defaults.set(["willCodexQuotaReset"], forKey: ForecastSourceSelection.defaultsKey)
+        defaults.set("willCodexQuotaReset", forKey: ForecastSource.defaultsKey)
+        XCTAssertEqual(ForecastSourceSelection.load(from: defaults), [.willCodexQuotaReset])
+        defaults.set(["willCodexQuotaReset", "gussuri"], forKey: ForecastSourceSelection.defaultsKey)
+        XCTAssertEqual(ForecastSourceSelection.load(from: defaults), [.willCodexQuotaReset, .gussuri])
+    }
+
     func testConditionalResetAnnouncementRequiresAccountAnswer() throws {
         let announcement = ResetAnnouncement(
             id: "conditional-reset",
@@ -31,66 +106,24 @@ final class ForecastSelectionTests: XCTestCase {
         let providers = fixtures()
 
         XCTAssertEqual(try ForecastService.snapshot(from: providers, selected: .lunarWerx).score, 22, accuracy: 0.001)
-        XCTAssertEqual(try ForecastService.snapshot(from: providers, selected: .willCodexQuotaReset).score, 27, accuracy: 0.001)
         XCTAssertEqual(try ForecastService.snapshot(from: providers, selected: .gussuri).score, 43, accuracy: 0.001)
     }
 
     func testAverageUsesEveryAvailableCachedPercentage() throws {
         let snapshot = try ForecastService.snapshot(from: fixtures(), selected: .average)
-        XCTAssertEqual(snapshot.score, (22.0 + 27.0 + 43.0) / 3.0, accuracy: 0.001)
+        XCTAssertEqual(snapshot.score, (22.0 + 43.0) / 2.0, accuracy: 0.001)
         XCTAssertEqual(snapshot.source, .average)
     }
 
-    func testSelectedPolymarketOddsContributeToMultiSourceAverage() throws {
-        var providers = fixtures()
-        providers.append(provider(
-            .polymarket,
-            score: 82.5,
-            forecastDeadline: Date().addingTimeInterval(5 * 86_400)
-        ))
-
-        let average = try ForecastService.snapshot(from: providers, selected: .average)
-        let marketOnly = try ForecastService.snapshot(from: providers, selected: .polymarket)
-
-        XCTAssertEqual(average.score, (22.0 + 27.0 + 43.0 + 82.5) / 4.0, accuracy: 0.001)
-        XCTAssertNil(average.scheduledReset)
-        XCTAssertEqual(marketOnly.score, 82.5, accuracy: 0.001)
-        XCTAssertNotNil(marketOnly.scheduledReset)
-    }
-
-    func testPolymarketUsesEarliestOpenDeadlineAndPricesEightyDollarHedge() throws {
-        let json = #"""
-        {
-          "updatedAt": "2026-09-02T14:23:00.42304Z",
-          "markets": [
-            {
-              "groupItemTitle": "September 14",
-              "endDate": "2026-09-15T03:59:00Z",
-              "active": true,
-              "closed": false,
-              "outcomes": "[\"Yes\", \"No\"]",
-              "outcomePrices": "[\"0.86\", \"0.14\"]"
-            },
-            {
-              "groupItemTitle": "September 7",
-              "endDate": "2026-09-08T03:59:00Z",
-              "active": true,
-              "closed": false,
-              "outcomes": "[\"Yes\", \"No\"]",
-              "outcomePrices": "[\"0.825\", \"0.175\"]"
-            }
-          ]
-        }
-        """#
-        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-09-02T14:00:00Z"))
-        let provider = try ForecastService.polymarketProvider(from: Data(json.utf8), now: now)
-        let hedge = try XCTUnwrap(provider.polymarketHedge)
-
-        XCTAssertEqual(try XCTUnwrap(provider.score), 82.5, accuracy: 0.001)
-        XCTAssertEqual(hedge.marketLabel, "September 7")
-        XCTAssertEqual(hedge.noPrice, 0.175, accuracy: 0.001)
-        XCTAssertEqual(hedge.stake, 14, accuracy: 0.001)
-        XCTAssertEqual(hedge.grossProfit, 66, accuracy: 0.001)
+    func testRestoredPolymarketSelectionPreservesOtherSources() {
+        let suite = "RemovedPolymarket-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(["polymarket", "codexResets"], forKey: ForecastSourceSelection.defaultsKey)
+        XCTAssertEqual(ForecastSourceSelection.load(from: defaults), [.polymarket, .codexResets])
+        defaults.set(["polymarket"], forKey: ForecastSourceSelection.defaultsKey)
+        defaults.set("polymarket", forKey: ForecastSource.defaultsKey)
+        XCTAssertEqual(ForecastSourceSelection.load(from: defaults), [.polymarket])
     }
 
     func testProviderWithoutPercentageShowsZeroWithoutBorrowingUnselectedSources() throws {
@@ -126,7 +159,7 @@ final class ForecastSelectionTests: XCTestCase {
             url: URL(string: "https://example.com/reset")
         )
         var providers = fixtures()
-        providers[3] = provider(.gussuri, score: 43, announcement: announcement)
+        providers[2] = provider(.gussuri, score: 43, announcement: announcement)
 
         for source in ForecastSource.allCases {
             let snapshot = try ForecastService.snapshot(from: providers, selected: source)
@@ -147,7 +180,7 @@ final class ForecastSelectionTests: XCTestCase {
             url: nil
         )
         var providers = fixtures()
-        providers[3] = provider(.gussuri, score: 43, announcement: expired)
+        providers[2] = provider(.gussuri, score: 43, announcement: expired)
 
         let snapshot = try ForecastService.snapshot(from: providers, selected: .gussuri)
         XCTAssertEqual(snapshot.score, 43, accuracy: 0.001)
@@ -229,7 +262,6 @@ final class ForecastSelectionTests: XCTestCase {
         [
             provider(.lunarWerx, score: 22, range: 8...53),
             provider(.codexResets, score: nil),
-            provider(.willCodexQuotaReset, score: 27),
             provider(.gussuri, score: 43)
         ]
     }
@@ -253,8 +285,7 @@ final class ForecastSelectionTests: XCTestCase {
             signals: [],
             updatedAt: Date(),
             forecastDeadline: forecastDeadline,
-            announcement: announcement,
-            polymarketHedge: nil
+            announcement: announcement
         )
     }
 }

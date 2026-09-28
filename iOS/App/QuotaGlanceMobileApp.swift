@@ -8,11 +8,23 @@ struct QuotaGlanceMobileApp: App {
 
     var body: some Scene {
         WindowGroup {
-            DashboardView(store: store)
+            rootContent
                 .task(id: scenePhase) {
                     guard scenePhase == .active else { return }
                     await store.start()
+#if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("--quota-preview-live-system") {
+                        var sample = store.snapshot
+                        let args = ProcessInfo.processInfo.arguments
+                        if args.contains("--quota-preview-live-codex") { sample.recentProviderActivity = ["codex": .now] }
+                        if args.contains("--quota-preview-live-claude") { sample.recentProviderActivity = ["claude": .now] }
+                        await ProviderUsageActivityManager.shared.sync(snapshot: sample)
+                    }
+#endif
                     await store.runForegroundSyncLoop()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .directProviderUsageChanged)) { _ in
+                    Task { await store.refreshPhoneUsage() }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .quotaCloudChanged)) { _ in
                     Task { await store.refreshFromSharedSnapshotIfNew() }
@@ -35,4 +47,20 @@ struct QuotaGlanceMobileApp: App {
                 }
         }
     }
+
+    @ViewBuilder
+    private var rootContent: some View {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--quota-preview-widgets")
+            || ProcessInfo.processInfo.arguments.contains("--quota-preview-lock-widgets")
+            || ProcessInfo.processInfo.arguments.contains("--quota-preview-live-activity") {
+            WidgetPreviewGallery(snapshot: ProcessInfo.processInfo.arguments.contains("--quota-preview-empty") ? .empty : store.snapshot)
+        } else {
+            DashboardView(store: store)
+        }
+#else
+        DashboardView(store: store)
+#endif
+    }
+
 }
