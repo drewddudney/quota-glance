@@ -808,101 +808,6 @@ enum ForecastSourceSelection {
 }
 
 @MainActor
-private final class ResetCalculatorMenuView: NSView {
-    private var buttons: [ForecastSource: NSButton] = [:]
-    private let selectionLabel = NSTextField(labelWithString: "")
-
-    init(selectedSources: Set<ForecastSource>) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 238, height: 184))
-
-        let title = NSTextField(labelWithString: "AVERAGE SELECTED SOURCES")
-        title.font = .monospacedSystemFont(ofSize: 9, weight: .semibold)
-        title.textColor = .secondaryLabelColor
-
-        selectionLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        selectionLabel.textColor = .labelColor
-
-        let header = NSStackView(views: [title, selectionLabel])
-        header.orientation = .vertical
-        header.alignment = .leading
-        header.spacing = 2
-
-        let sourceStack = NSStackView()
-        sourceStack.orientation = .vertical
-        sourceStack.alignment = .leading
-        sourceStack.spacing = 2
-
-        for source in ForecastSource.calculatorCases {
-            let button = NSButton(
-                checkboxWithTitle: source.displayName,
-                target: self,
-                action: #selector(toggleSource(_:))
-            )
-            button.identifier = NSUserInterfaceItemIdentifier(source.rawValue)
-            button.state = selectedSources.contains(source) ? .on : .off
-            button.font = .systemFont(ofSize: 13)
-            button.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            sourceStack.addArrangedSubview(button)
-            button.widthAnchor.constraint(equalToConstant: 214).isActive = true
-            buttons[source] = button
-        }
-
-        let stack = NSStackView(views: [header, sourceStack])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 9
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10)
-        ])
-
-        updateSelectionLabel(selectedSources)
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    @objc private func toggleSource(_ sender: NSButton) {
-        guard
-            let rawValue = sender.identifier?.rawValue,
-            let source = ForecastSource(rawValue: rawValue),
-            ForecastSource.calculatorCases.contains(source)
-        else { return }
-
-        var selected = ForecastSourceSelection.load()
-        if sender.state == .on {
-            selected.insert(source)
-        } else if selected.count > 1 {
-            selected.remove(source)
-        } else {
-            sender.state = .on
-            NSSound.beep()
-            return
-        }
-
-        ForecastSourceSelection.save(selected)
-        for (source, button) in buttons {
-            button.state = selected.contains(source) ? .on : .off
-        }
-        updateSelectionLabel(selected)
-        NotificationCenter.default.post(
-            name: .quotaGlanceResetCalculatorChanged,
-            object: ForecastSource.calculatorCases.filter(selected.contains).map(\.rawValue)
-        )
-    }
-
-    private func updateSelectionLabel(_ selected: Set<ForecastSource>) {
-        selectionLabel.stringValue = ForecastSourceSelection.label(for: selected)
-    }
-}
-
-@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let claudeBar = ClaudeBarController.shared
@@ -1074,14 +979,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showDisplayOptions() { providerDisplay.showSettings() }
 
     @objc private func showCodexResetCalculator() {
+        guard let model = runtime?.model else { return }
         if calculatorWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 260, height: 200), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 650), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.title = "Codex reset calculator"
             window.isReleasedWhenClosed = false
+            window.minSize = NSSize(width: 450, height: 500)
+            window.contentView = NSHostingView(rootView: ResetCalculatorWindowView(model: model))
             window.center()
             calculatorWindow = window
         }
-        calculatorWindow?.contentView = ResetCalculatorMenuView(selectedSources: ForecastSourceSelection.load())
         calculatorWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -1456,6 +1363,10 @@ final class DashboardModel: ObservableObject {
     func refresh() {
         refreshForecast()
         refreshCodex()
+    }
+
+    func refreshResetForecast() {
+        refreshForecast()
     }
 
     func noteMenuInteraction() {
