@@ -157,6 +157,13 @@ enum ProviderDisplayGeometry {
                        y: min(inset.maxY, max(point.y, inset.minY + size.height)))
     }
 
+    static func floatingFrame(size: NSSize, origin: NSPoint, in visible: NSRect) -> NSRect {
+        let fitted = NSSize(width: min(size.width, visible.width), height: min(size.height, visible.height))
+        return NSRect(x: min(max(origin.x, visible.minX), visible.maxX - fitted.width),
+                      y: min(max(origin.y, visible.minY), visible.maxY - fitted.height),
+                      width: fitted.width, height: fitted.height)
+    }
+
     static func initialOrigin(style: ProviderDisplayStyle, in visible: NSRect, providerCount: Int = 2) -> NSPoint {
         let size = size(style: style, providerCount: providerCount)
         switch style {

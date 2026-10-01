@@ -14,7 +14,6 @@ struct NotificationPreferences: Equatable {
         static let stale = "QuotaGlance.notify.stale"
         static let tibo = "QuotaGlance.notify.tibo"
         static let codexTasks = "QuotaGlance.notify.codexTasks"
-        static let sessionLiveActivity = "QuotaGlance.liveActivity.codexSession"
         static let claudeUsage = "QuotaGlance.notify.claudeUsage"
         static let claudeWeek = "QuotaGlance.notify.claudeWeek"
     }
@@ -30,7 +29,6 @@ struct NotificationPreferences: Equatable {
     var staleSync: Bool
     var tiboPosts: Bool
     var codexTasks: Bool
-    var sessionLiveActivity: Bool
     var claudeUsage: Bool
     var claudeWeek: Bool
 
@@ -65,9 +63,6 @@ struct NotificationPreferences: Equatable {
             staleSync: defaults.bool(forKey: Key.stale),
             tiboPosts: defaults.object(forKey: Key.tibo) == nil ? true : defaults.bool(forKey: Key.tibo),
             codexTasks: defaults.object(forKey: Key.codexTasks) == nil ? true : defaults.bool(forKey: Key.codexTasks),
-            sessionLiveActivity: defaults.object(forKey: Key.sessionLiveActivity) == nil
-                ? true
-                : defaults.bool(forKey: Key.sessionLiveActivity),
             claudeUsage: defaults.object(forKey: Key.claudeUsage) == nil ? true : defaults.bool(forKey: Key.claudeUsage),
             claudeWeek: defaults.object(forKey: Key.claudeWeek) == nil ? true : defaults.bool(forKey: Key.claudeWeek)
         )
@@ -86,7 +81,6 @@ struct NotificationPreferences: Equatable {
         defaults.set(staleSync, forKey: Key.stale)
         defaults.set(tiboPosts, forKey: Key.tibo)
         defaults.set(codexTasks, forKey: Key.codexTasks)
-        defaults.set(sessionLiveActivity, forKey: Key.sessionLiveActivity)
         defaults.set(claudeUsage, forKey: Key.claudeUsage)
         defaults.set(claudeWeek, forKey: Key.claudeWeek)
     }

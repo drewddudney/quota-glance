@@ -25,8 +25,6 @@ final class ProviderAppRuntime {
             .sink { [weak self] _ in self?.model.refresh() }.store(in: &subscriptions)
         center.publisher(for: .quotaGlanceMenuInteraction).receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.model.noteMenuInteraction() }.store(in: &subscriptions)
-        center.publisher(for: .quotaGlancePrivateLiveFeedTest).receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.model.publishMobileSnapshot() }.store(in: &subscriptions)
         center.publisher(for: NSUbiquitousKeyValueStore.didChangeExternallyNotification).receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 let keys = notification.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]

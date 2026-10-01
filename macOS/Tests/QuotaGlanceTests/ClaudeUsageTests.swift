@@ -58,17 +58,6 @@ final class ClaudeUsageTests: XCTestCase {
         XCTAssertEqual(ClaudeUsageClient.retryDate("nonsense", now: now), now.addingTimeInterval(300))
     }
 
-    func testIndependentBarPlacementRestoresOnScreenAndUsesItsOwnSize() {
-        let screen = NSRect(x: -1920, y: 50, width: 1920, height: 1000)
-        let size = NSSize(width: 176, height: 274)
-        let restored = ClaudeBarGeometry.frame(size: size, origin: NSPoint(x: 2000, y: -200), dock: .floating, in: screen)
-        XCTAssertEqual(restored, NSRect(x: -176, y: 50, width: 176, height: 274))
-        let left = ClaudeBarGeometry.frame(size: size, origin: NSPoint(x: -100, y: 200), dock: .left, in: screen)
-        XCTAssertEqual(left.minX, -1920)
-        XCTAssertEqual(left.minY, 200)
-        XCTAssertEqual(left.size, size)
-    }
-
     private func decode(_ payload: String) throws -> ClaudeUsageSnapshot {
         try ClaudeUsageClient.decode(Data(payload.utf8), credentialID: "fixture", plan: nil)
     }

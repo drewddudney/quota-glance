@@ -6,16 +6,18 @@ import UIKit
 final class ProviderUsageActivityManager: ObservableObject {
     static let shared = ProviderUsageActivityManager()
     private static let enabledKey = "QuotaGlance.mobile.automaticUsageActivity"
+    private static let lastStartedKey = "QuotaGlance.mobile.lastStartedUsageActivitySignal"
     @Published private(set) var isRunning = !Activity<ProviderUsageActivityAttributes>.activities.isEmpty
     @Published private(set) var isEnabled = UserDefaults.standard.object(forKey: enabledKey) == nil || UserDefaults.standard.bool(forKey: enabledKey)
     @Published private(set) var message: String?
-    private var lastStartedSignal: Date?
+    private var lastStartedSignal = UserDefaults.standard.object(forKey: ProviderUsageActivityManager.lastStartedKey) as? Date
 
     func setEnabled(_ enabled: Bool, snapshot: QuotaSnapshot) async {
         isEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
         if enabled {
             lastStartedSignal = nil
+            UserDefaults.standard.removeObject(forKey: Self.lastStartedKey)
             await sync(snapshot: snapshot)
         } else { await stop() }
     }
@@ -48,6 +50,7 @@ final class ProviderUsageActivityManager: ObservableObject {
         do {
             _ = try Activity.request(attributes: ProviderUsageActivityAttributes(startedAt: now), content: content, pushType: nil)
             lastStartedSignal = signal
+            UserDefaults.standard.set(signal, forKey: Self.lastStartedKey)
             isRunning = true
             message = nil
         } catch {

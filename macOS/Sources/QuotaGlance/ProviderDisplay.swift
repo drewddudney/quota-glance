@@ -173,7 +173,7 @@ final class ProviderDisplayController: NSObject, ObservableObject, NSPopoverDele
             let saved = restoreFrame ? UserDefaults.standard.string(forKey: frameKey).map(NSRectFromString) : nil
             let initial = ProviderDisplayGeometry.initialOrigin(style: style, in: visible, providerCount: selection.providers.count)
             let origin = saved.map { visible.intersects($0) ? $0.origin : initial } ?? initial
-            frames = [ClaudeBarGeometry.frame(size: size, origin: origin, dock: .floating, in: visible)]
+            frames = [ProviderDisplayGeometry.floatingFrame(size: size, origin: origin, in: visible)]
         }
         for index in frames.indices {
             let panel: ProviderPanel
@@ -230,7 +230,7 @@ final class ProviderDisplayController: NSObject, ObservableObject, NSPopoverDele
         if let screen = screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? panel.screen {
             displayID = Self.id(for: screen)
             UserDefaults.standard.set(displayID, forKey: "QuotaGlance.providers.display")
-            panel.setFrame(ClaudeBarGeometry.frame(size: ProviderDisplayGeometry.size(style: style, providerCount: selection.providers.count), origin: panel.frame.origin, dock: .floating, in: screen.visibleFrame), display: true)
+            panel.setFrame(ProviderDisplayGeometry.floatingFrame(size: ProviderDisplayGeometry.size(style: style, providerCount: selection.providers.count), origin: panel.frame.origin, in: screen.visibleFrame), display: true)
         }
         saveFrame()
         syncTweetBubble()
@@ -284,7 +284,7 @@ final class ProviderDisplayController: NSObject, ObservableObject, NSPopoverDele
             : NSPoint(x: anchorFrame.minX - size.width - 8,
                       y: min(anchorFrame.maxY, visible.maxY) - size.height - 4)
         panel.level = anchor?.level ?? .floating
-        panel.setFrame(ClaudeBarGeometry.frame(size: size, origin: origin, dock: .floating, in: visible), display: true)
+        panel.setFrame(ProviderDisplayGeometry.floatingFrame(size: size, origin: origin, in: visible), display: true)
         panel.orderFrontRegardless()
     }
 

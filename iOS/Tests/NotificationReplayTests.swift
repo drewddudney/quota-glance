@@ -7,7 +7,7 @@ final class NotificationReplayTests: XCTestCase {
         .init(resetAnnounced: true, resetCompleted: true, prominentResetAlert: false,
               usageApproachingLimit: false, usageThreshold: 90, renewalSoon: false,
               resetCreditExpiring: false, paceRisk: false, staleSync: false,
-              tiboPosts: true, codexTasks: false, sessionLiveActivity: false,
+              tiboPosts: true, codexTasks: false,
               claudeUsage: false, claudeWeek: false)
     }
 
@@ -36,7 +36,7 @@ final class NotificationReplayTests: XCTestCase {
         let suite = "NotificationReplayTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let savedPost = post("2100000000000000002", at: Date().addingTimeInterval(-3_600), reset: true)
+        let savedPost = post("2103637477760311522", at: Date().addingTimeInterval(-3_600), reset: true)
         let saved = snapshot(savedPost, source: "gussuri")
         defaults.set("gussuri:\(savedPost.url!.absoluteString)", forKey: "QuotaGlance.notifiedAnnouncementID")
         NotificationManager.saveTiboNotificationState(
@@ -61,18 +61,18 @@ final class NotificationReplayTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         var requests: [String] = []
         let delivery = NotificationDelivery(defaults: defaults) { requests.append($0.identifier) }
-        let baselinePost = post("2100000000000000001", at: Date().addingTimeInterval(-7_200))
+        let baselinePost = post("2103637477760311520", at: Date().addingTimeInterval(-7_200))
         let baseline = snapshot(baselinePost)
         await NotificationManager.evaluate(baseline, previous: baseline, preferences: preferences, delivery: delivery)
 
-        let resetPost = post("2100000000000000002", at: Date().addingTimeInterval(-60), reset: true)
+        let resetPost = post("2103637477760311522", at: Date().addingTimeInterval(-60), reset: true)
         let reset = snapshot(resetPost, source: "lunar")
         await NotificationManager.evaluate(reset, previous: baseline, preferences: preferences, delivery: delivery)
         await NotificationManager.evaluate(snapshot(resetPost, source: "will"), previous: reset,
                                            preferences: preferences, delivery: delivery)
         XCTAssertEqual(requests, ["reset-announced-x:\(resetPost.id)"])
 
-        let laterPost = post("2100000000000000003", at: Date())
+        let laterPost = post("2103637477760311523", at: Date())
         let later = snapshot(laterPost)
         await NotificationManager.evaluate(later, previous: reset, preferences: preferences, delivery: delivery)
         let relaunched = NotificationDelivery(defaults: defaults) { requests.append($0.identifier) }
@@ -85,10 +85,10 @@ final class NotificationReplayTests: XCTestCase {
         let suite = "NotificationReplayTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let baseline = snapshot(post("2100000000000000001", at: Date().addingTimeInterval(-3_600)))
+        let baseline = snapshot(post("2103637477760311520", at: Date().addingTimeInterval(-3_600)))
         NotificationManager.saveTiboNotificationState(
             NotificationManager.tiboNotificationState(posts: baseline.tiboPosts!, defaults: defaults), defaults: defaults)
-        let current = snapshot(post("2100000000000000002", at: Date()))
+        let current = snapshot(post("2103637477760311522", at: Date()))
         let queued = expectation(description: "First notification is awaiting iOS")
         var resume: CheckedContinuation<Void, Never>?
         var requests: [String] = []
@@ -142,10 +142,10 @@ final class NotificationReplayTests: XCTestCase {
             if attempts == 1 { throw URLError(.notConnectedToInternet) }
         }
         let content = UNMutableNotificationContent()
-        let failed = await delivery.add(content, identifier: "reset-announced-x:2100000000000000002")
-        let retried = await delivery.add(content, identifier: "reset-announced-x:2100000000000000002")
+        let failed = await delivery.add(content, identifier: "reset-announced-x:2103637477760311522")
+        let retried = await delivery.add(content, identifier: "reset-announced-x:2103637477760311522")
         let relaunched = NotificationDelivery(defaults: defaults) { _ in attempts += 1 }
-        let duplicate = await relaunched.add(content, identifier: "reset-announced-x:2100000000000000002")
+        let duplicate = await relaunched.add(content, identifier: "reset-announced-x:2103637477760311522")
         XCTAssertFalse(failed)
         XCTAssertTrue(retried)
         XCTAssertFalse(duplicate)

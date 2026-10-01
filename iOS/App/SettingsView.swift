@@ -103,7 +103,6 @@ struct SettingsView: View {
             .onChange(of: scenePhase) { if scenePhase == .active { Task { await refreshAuthorization() } } }
             .onChange(of: preferences) {
                 preferences.save()
-                Task { await CodexSessionLiveActivityManager.shared.sync(with: store.snapshot, preferences: preferences) }
             }
         }
     }
@@ -122,7 +121,6 @@ struct SettingsView: View {
                 if macDetails {
                     Toggle("Subscription renewal", isOn: $preferences.renewalSoon)
                     Toggle("Task changes", isOn: $preferences.codexTasks)
-                    Toggle("Mac task Live Activity", isOn: $preferences.sessionLiveActivity)
                 }
                 Toggle("Usage out of date", isOn: $preferences.staleSync)
             }

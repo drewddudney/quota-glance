@@ -42,8 +42,7 @@
 - Records Codex and Claude usage percentages for interactive calendars, pace ranges, and previous quota weeks. Claude’s graph is available in Activity and its pet details, using its own account and quota window. Collection starts from real provider measurements; account changes and resets keep each history separate. Expandable Tibo posts and replies and focused notification controls remain available. The phone follows system light/dark appearance.
 - **Follow active providers** starts a usage Live Activity after recent quota increases and considers each provider active for six minutes after an increase. It shows both when both are active, independently of the app’s provider selector. First connections, resets, and account changes do not count as activity. An app refresh ends a quiet activity; if iOS has suspended the app, its Lock Screen card becomes stale and offers **Open to refresh**.
 - With one active provider, the compact Dynamic Island shows its pet and weekly percentage on the left and estimated weekly quota time remaining on the right. With both active, each side shows one pet and percentage. Pace appears after enough recorded usage and stays separate from the reset countdown.
-- Pets hop when readings change. Confirmed resets can send Codex through a confetti loop or Claude into a token pool; both scenes have previews in **Settings → Pet animations**. Live Activities use short transitions when data updates and respect Reduce Motion and the always-on display.
-- Also supports a Live Activity for an announced reset countdown.
+- Pets hop when readings change. For each provider, **Settings → Pet animations** offers four reset scenes, Shuffle, and Off, with previews, short sound effects, and a sound toggle. Confirmed resets play once while the app is open. Live Activities use short transitions when data updates and respect Reduce Motion and the always-on display.
 - Supports Time Sensitive notifications for reset announcements and completed resets.
 - Refreshes directly while open and when iOS grants background time. Live Activities cannot fetch usage themselves; continuous updates while the app is closed require a push service, which is not included. Optional Mac details sync through the user's private CloudKit database.
 
@@ -119,7 +118,7 @@ The checked-in identifiers use the `com.example.quotaglance` placeholder, and no
 | App group | `group.com.example.quotaglance` |
 | CloudKit container | `iCloud.com.example.quotaglance` |
 
-Update the values in both project files, entitlements, Info plists, and Swift constants so the app group, CloudKit container, background task, and optional Live Activity push topic agree. Create the matching App Group and CloudKit container in the Apple Developer portal, then select your development team in Xcode. The key-value store entitlement uses Xcode’s team prefix. Both apps must use the same CloudKit container for private sync. If you use the optional private Live Activity push feed, supply your own APNs signing key and team ID through the app’s local configuration screen.
+Update the values in both project files, entitlements, Info plists, and Swift constants so the app group, CloudKit container, and background task agree. Create the matching App Group and CloudKit container in the Apple Developer portal, then select your development team in Xcode. The key-value store entitlement uses Xcode’s team prefix. Both apps must use the same CloudKit container for private sync.
 
 No API key, shared account, or maintainer-owned backend is required.
 

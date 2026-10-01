@@ -205,7 +205,6 @@ actor MobileSnapshotPublisher {
             UserDefaults.standard.set(Date(), forKey: Self.lastSuccessKey)
             UserDefaults.standard.removeObject(forKey: Self.lastErrorKey)
             Self.logger.notice("Phone snapshot saved to private CloudKit")
-            await PrivateLiveActivityRelay.shared.sync(snapshot)
         } catch {
             recordFailure(error.localizedDescription)
         }

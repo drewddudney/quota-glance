@@ -68,6 +68,29 @@ final class QuotaSnapshotTests: XCTestCase {
         XCTAssertFalse(snapshot.hasActiveCodexSession(at: now))
     }
 
+    func testAccountUsageCanKeepActivityVisibleWithoutLocalTasks() {
+        let now = Date()
+        var snapshot = QuotaSnapshot.empty
+        snapshot.capturedAt = now
+        snapshot.usagePercent = 24
+        snapshot.activeTasks = []
+        snapshot.usageHistory = [.init(date: now.addingTimeInterval(-60), usedPercent: 23, tokens: 100)]
+        XCTAssertTrue(snapshot.hasActiveCodexSession(at: now))
+        snapshot.usagePercent = 23
+        XCTAssertFalse(snapshot.hasActiveCodexSession(at: now))
+    }
+
+    func testFreshForecastDoesNotMakeOldUsageActive() {
+        let now = Date()
+        var snapshot = QuotaSnapshot.empty
+        snapshot.capturedAt = now
+        snapshot.usageUpdatedAt = now.addingTimeInterval(-601)
+        snapshot.activeTasks = [.init(id: "task", name: "Work", state: "running", source: "codex", updatedAt: now)]
+        XCTAssertFalse(snapshot.hasActiveCodexSession(at: now))
+        snapshot.usageUpdatedAt = now.addingTimeInterval(-30)
+        XCTAssertTrue(snapshot.hasActiveCodexSession(at: now))
+    }
+
     func testReportedTaskCountsAsAnActiveCodexSession() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         var snapshot = QuotaSnapshot.empty
@@ -400,96 +423,5 @@ final class QuotaSnapshotTests: XCTestCase {
         let points = QuotaChartHistory.currentPoints(from: snapshot, now: now)
 
         XCTAssertEqual(points.map(\.usedPercent), [0, 0, 1, 2, 3, 4, 5])
-    }
-
-    func testLiveActivityProjectsPercentageFromMeasuredTokenPace() {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        var snapshot = QuotaSnapshot.empty
-        snapshot.capturedAt = now
-        snapshot.usagePercent = 19
-        snapshot.weeklyTokens = 243_700_000
-        snapshot.usageHistory = [
-            .init(date: now.addingTimeInterval(-60 * 60), usedPercent: 0, tokens: 0),
-            .init(date: now, usedPercent: 19, tokens: 243_700_000)
-        ]
-
-        let velocity = CodexSessionUsageProjection.percentPerMinute(
-            snapshot: snapshot,
-            tokensPerMinute: 670_800
-        )
-        let projected = CodexSessionUsageProjection.projectedPercent(
-            basePercent: 19,
-            percentPerMinute: velocity,
-            updatedAt: now,
-            now: now.addingTimeInterval(30)
-        )
-
-        XCTAssertEqual(velocity, 0.0523, accuracy: 0.0001)
-        XCTAssertEqual(projected, 19.026, accuracy: 0.001)
-    }
-
-    func testLiveActivityStartsFromProgressSinceLastPercentageChange() {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        var snapshot = QuotaSnapshot.empty
-        snapshot.capturedAt = now
-        snapshot.usagePercent = 19
-        snapshot.usageHistory = [
-            .init(date: now.addingTimeInterval(-12 * 60), usedPercent: 18, tokens: 220_000_000),
-            .init(date: now.addingTimeInterval(-6 * 60), usedPercent: 19, tokens: 228_000_000),
-            .init(date: now.addingTimeInterval(-3 * 60), usedPercent: 19, tokens: 232_000_000),
-            .init(date: now, usedPercent: 19, tokens: 236_000_000)
-        ]
-
-        let refreshed = CodexSessionUsageProjection.estimatedPercentAtRefresh(
-            snapshot: snapshot,
-            percentPerMinute: 0.05
-        )
-        let projected = CodexSessionUsageProjection.projectedPercent(
-            basePercent: refreshed,
-            percentPerMinute: 0.05,
-            updatedAt: now,
-            now: now.addingTimeInterval(30)
-        )
-
-        XCTAssertEqual(refreshed, 19.3, accuracy: 0.0001)
-        XCTAssertEqual(projected, 19.325, accuracy: 0.0001)
-    }
-
-    func testLiveActivityDoesNotEstimatePastNextUnconfirmedPercentage() {
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        var snapshot = QuotaSnapshot.empty
-        snapshot.capturedAt = now
-        snapshot.usagePercent = 19
-        snapshot.usageHistory = [
-            .init(date: now.addingTimeInterval(-60 * 60), usedPercent: 18, tokens: 100),
-            .init(date: now.addingTimeInterval(-30 * 60), usedPercent: 19, tokens: 200),
-            .init(date: now, usedPercent: 19, tokens: 300)
-        ]
-
-        let refreshed = CodexSessionUsageProjection.estimatedPercentAtRefresh(
-            snapshot: snapshot,
-            percentPerMinute: 0.2
-        )
-        let projected = CodexSessionUsageProjection.projectedPercent(
-            basePercent: refreshed,
-            percentPerMinute: 0.2,
-            updatedAt: now,
-            now: now.addingTimeInterval(10 * 60)
-        )
-
-        XCTAssertEqual(refreshed, 19.999, accuracy: 0.0001)
-        XCTAssertEqual(projected, 19.999, accuracy: 0.0001)
-    }
-
-    func testLiveActivityProjectionStopsAfterTenMinutesWithoutRefresh() {
-        let start = Date(timeIntervalSince1970: 1_800_000_000)
-        let projected = CodexSessionUsageProjection.projectedPercent(
-            basePercent: 19,
-            percentPerMinute: 0.05,
-            updatedAt: start,
-            now: start.addingTimeInterval(60 * 60)
-        )
-
-        XCTAssertEqual(projected, 19.5, accuracy: 0.0001)
     }
 }

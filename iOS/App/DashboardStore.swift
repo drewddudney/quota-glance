@@ -187,7 +187,7 @@ final class DashboardStore: ObservableObject {
         guard !Self.isPreview else { return }
         guard !hasStarted else { await refresh(); return }
         hasStarted = true
-        await LiveActivityPushTokenPublisher.shared.start()
+        await RetiredActivityCleanup.run()
         if PhoneSyncSettings.includesMacDetails { await CloudSnapshotService.installSubscriptionIfNeeded() }
         await refresh()
     }
@@ -236,8 +236,6 @@ final class DashboardStore: ObservableObject {
         snapshot = merged
         SharedSnapshotStore.save(merged)
         WidgetCenter.shared.reloadAllTimelines()
-        await ResetLiveActivityManager.shared.sync(with: merged)
-        await CodexSessionLiveActivityManager.shared.sync(with: merged)
         await ProviderUsageActivityManager.shared.sync(snapshot: merged)
         PhonePetCelebrationCoordinator.shared.observe(previous: previousSnapshot, current: merged)
         await NotificationManager.evaluate(merged, previous: previousSnapshot, preferences: .load())
@@ -316,8 +314,6 @@ final class DashboardStore: ObservableObject {
         state = Self.syncState(for: incoming)
         SharedSnapshotStore.save(incoming)
         WidgetCenter.shared.reloadAllTimelines()
-        await ResetLiveActivityManager.shared.sync(with: incoming)
-        await CodexSessionLiveActivityManager.shared.sync(with: incoming)
         await ProviderUsageActivityManager.shared.sync(snapshot: incoming)
         PhonePetCelebrationCoordinator.shared.observe(previous: previousSnapshot, current: incoming)
         await NotificationManager.evaluate(incoming, previous: previousSnapshot, preferences: .load())
@@ -330,7 +326,6 @@ final class DashboardStore: ObservableObject {
         snapshot.applyResetApplicabilityResponse(ResetApplicability.load())
         SharedSnapshotStore.save(snapshot)
         WidgetCenter.shared.reloadAllTimelines()
-        await ResetLiveActivityManager.shared.sync(with: snapshot)
         await NotificationManager.evaluate(snapshot, previous: previous, preferences: .load())
     }
 
@@ -341,7 +336,6 @@ final class DashboardStore: ObservableObject {
         guard snapshot != previous else { return }
         SharedSnapshotStore.save(snapshot)
         WidgetCenter.shared.reloadAllTimelines()
-        await ResetLiveActivityManager.shared.sync(with: snapshot)
     }
 
     private func cloudSnapshot() async -> QuotaSnapshot? {
@@ -550,8 +544,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         if changed {
             SharedSnapshotStore.save(snapshot)
             WidgetCenter.shared.reloadAllTimelines()
-            await ResetLiveActivityManager.shared.sync(with: snapshot)
-            await CodexSessionLiveActivityManager.shared.sync(with: snapshot)
             await ProviderUsageActivityManager.shared.sync(snapshot: snapshot)
             await NotificationManager.evaluate(snapshot, previous: previous, preferences: .load())
             if UIApplication.shared.applicationState == .active {
@@ -567,176 +559,27 @@ extension Notification.Name {
     static let quotaCloudChanged = Notification.Name("QuotaGlance.cloudChanged")
 }
 
-actor ResetLiveActivityManager {
-    static let shared = ResetLiveActivityManager()
+/// Keep the retired ActivityKit schemas for one upgrade path so activities
+/// created by older builds are dismissed immediately when the app launches.
+@MainActor
+enum RetiredActivityCleanup {
+    private static var completed = false
+    private static let tokenKeys = [
+        "QuotaGlance.liveActivity.codex.registration.v1",
+        "QuotaGlance.liveActivity.codex.pushToStart.v1"
+    ]
 
-    func sync(with snapshot: QuotaSnapshot, now: Date = Date()) async {
-        let activities = Activity<ResetCountdownAttributes>.activities
-        guard
-            ActivityAuthorizationInfo().areActivitiesEnabled,
-            let expectedAt = snapshot.activeAnnouncementExpectedAt,
-            !snapshot.resetRecentlyCompleted
-        else {
-            for activity in activities {
-                await activity.end(nil, dismissalPolicy: .immediate)
-            }
-            return
+    static func run() async {
+        guard !completed else { return }
+        completed = true
+        let store = NSUbiquitousKeyValueStore.default
+        for key in tokenKeys { store.removeObject(forKey: key) }
+        store.synchronize()
+        for activity in Activity<CodexSessionActivityAttributes>.activities {
+            await activity.end(nil, dismissalPolicy: .immediate)
         }
-
-        let announcementID = snapshot.announcementID ?? "reset-\(Int(expectedAt.timeIntervalSince1970))"
-        let state = ResetCountdownAttributes.ContentState(
-            expectedAt: expectedAt,
-            sourceLabel: snapshot.resetSourceLabel,
-            isDelayed: expectedAt <= now
-        )
-        let content = ActivityContent(
-            state: state,
-            staleDate: expectedAt
-        )
-
-        if let current = activities.first(where: { $0.attributes.announcementID == announcementID }) {
-            await current.update(content)
-            for duplicate in activities where duplicate.id != current.id {
-                await duplicate.end(nil, dismissalPolicy: .immediate)
-            }
-            return
-        }
-
-        for old in activities {
-            await old.end(nil, dismissalPolicy: .immediate)
-        }
-        do {
-            _ = try Activity.request(
-                attributes: ResetCountdownAttributes(announcementID: announcementID),
-                content: content,
-                pushType: nil
-            )
-        } catch {
-            // The in-app countdown remains available if Live Activities are disabled.
-        }
-    }
-}
-
-actor CodexSessionLiveActivityManager {
-    static let shared = CodexSessionLiveActivityManager()
-    private var projectionTask: Task<Void, Never>?
-
-    func sync(
-        with snapshot: QuotaSnapshot,
-        preferences: NotificationPreferences = .load(),
-        now: Date = Date()
-    ) async {
-        let activities = Activity<CodexSessionActivityAttributes>.activities
-        guard
-            preferences.sessionLiveActivity,
-            PhoneSyncSettings.includesMacDetails,
-            !PhoneSyncSettings.automaticUsageEnabled,
-            ActivityAuthorizationInfo().areActivitiesEnabled,
-            snapshot.hasActiveCodexSession(at: now)
-        else {
-            projectionTask?.cancel()
-            projectionTask = nil
-            for activity in activities {
-                await LiveActivityPushTokenPublisher.shared.stopObserving(activityID: activity.id)
-                await activity.end(nil, dismissalPolicy: .immediate)
-            }
-            return
-        }
-
-        let anchor = snapshot.usageWindowStart ?? snapshot.capturedAt
-        let sessionID = "usage-\(Int(anchor.timeIntervalSince1970))"
-        let task = snapshot.activeTasks?.first
-        let perMinute = CodexSessionUsageProjection.tokensPerMinute(snapshot: snapshot, now: now)
-        let percentPerMinute = CodexSessionUsageProjection.percentPerMinute(
-            snapshot: snapshot,
-            tokensPerMinute: perMinute
-        )
-        let estimatedPercent = CodexSessionUsageProjection.estimatedPercentAtRefresh(
-            snapshot: snapshot,
-            percentPerMinute: percentPerMinute
-        )
-        let state = CodexSessionActivityAttributes.ContentState(
-            taskName: (snapshot.activeTasks?.count ?? 0) > 1
-                ? "\(snapshot.activeTasks?.count ?? 0) Codex sessions active"
-                : task?.name ?? "Codex is working",
-            usedPercent: estimatedPercent,
-            totalTokens: snapshot.bestTokenTotal ?? 0,
-            tokensPerMinute: perMinute,
-            percentPerMinute: percentPerMinute,
-            updatedAt: snapshot.usageMeasurementDate
-        )
-        let content = ActivityContent(state: state, staleDate: now.addingTimeInterval(10 * 60))
-
-        if let current = activities.first(where: { $0.attributes.sessionID == sessionID }) {
-            await LiveActivityPushTokenPublisher.shared.observe(current)
-            await current.update(content)
-            for duplicate in activities where duplicate.id != current.id {
-                await LiveActivityPushTokenPublisher.shared.stopObserving(activityID: duplicate.id)
-                await duplicate.end(nil, dismissalPolicy: .immediate)
-            }
-            beginProjectionUpdates(for: current, from: state)
-            return
-        }
-
-        for old in activities {
-            await LiveActivityPushTokenPublisher.shared.stopObserving(activityID: old.id)
-            await old.end(nil, dismissalPolicy: .immediate)
-        }
-        do {
-            let activity = try Activity.request(
-                attributes: CodexSessionActivityAttributes(sessionID: sessionID),
-                content: content,
-                pushType: .token
-            )
-            await LiveActivityPushTokenPublisher.shared.observe(activity)
-            beginProjectionUpdates(for: activity, from: state)
-        } catch {
-            // The in-app activity remains optional when iOS has disabled it.
-        }
-    }
-
-    /// Send occasional ActivityKit anchors while the app process is available.
-    /// The widget interpolates between them, avoiding a system state write every second.
-    private func beginProjectionUpdates(
-        for activity: Activity<CodexSessionActivityAttributes>,
-        from anchor: CodexSessionActivityAttributes.ContentState
-    ) {
-        projectionTask?.cancel()
-        guard (anchor.percentPerMinute ?? 0) > 0 else {
-            projectionTask = nil
-            return
-        }
-
-        projectionTask = Task {
-            let expiresAt = anchor.updatedAt.addingTimeInterval(
-                CodexSessionUsageProjection.maximumProjectionDuration
-            )
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(5))
-                guard !Task.isCancelled else { return }
-
-                let now = Date()
-                guard now <= expiresAt else { return }
-                let projected = CodexSessionUsageProjection.projectedPercent(
-                    basePercent: anchor.usedPercent,
-                    percentPerMinute: anchor.percentPerMinute ?? 0,
-                    updatedAt: anchor.updatedAt,
-                    now: now
-                )
-                let state = CodexSessionActivityAttributes.ContentState(
-                    taskName: anchor.taskName,
-                    usedPercent: projected,
-                    totalTokens: anchor.totalTokens,
-                    tokensPerMinute: anchor.tokensPerMinute,
-                    percentPerMinute: anchor.percentPerMinute,
-                    updatedAt: now
-                )
-                await activity.update(
-                    ActivityContent(state: state, staleDate: expiresAt)
-                )
-
-                if projected >= floor(anchor.usedPercent) + 0.999 { return }
-            }
+        for activity in Activity<ResetCountdownAttributes>.activities {
+            await activity.end(nil, dismissalPolicy: .immediate)
         }
     }
 }
