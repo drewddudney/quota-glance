@@ -368,7 +368,8 @@ extension ProviderReading {
         return Self(provider: .codex, usage: week?.usedPercent,
                     calendar: deadline.map { CodexService.calendarProgress(to: $0, at: now) }, deadline: deadline,
                     status: model.freshness == .live ? "Updated " + age(model.payload.lastSuccessfulAt, at: now) : model.payload.statusMessage,
-                    live: model.freshness == .live, resetChance: model.payload.forecastPercent)
+                    live: model.freshness == .live, resetChance: model.payload.forecastPercent,
+                    announcedResetAt: model.payload.expectedResetAt)
     }
     @MainActor static func claude(_ model: ClaudeUsageModel, at now: Date) -> Self {
         let week = model.snapshot?.weekly
@@ -431,6 +432,9 @@ struct ProviderDetailView: View {
                 }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 17) {
+                        if provider == .codex, let announcedResetAt = reading.announcedResetAt {
+                            announcedResetNotice(at: announcedResetAt, now: context.date)
+                        }
                         HStack(spacing: 28) {
                             detailMetric("Weekly usage", value: ProviderReading.percent(reading.usage))
                             detailMetric("Week elapsed", value: ProviderReading.percent(reading.calendar, calendar: true))
@@ -478,6 +482,29 @@ struct ProviderDetailView: View {
             Text(value).font(.system(size: 27, weight: .semibold, design: .rounded)).monospacedDigit()
             Text(label).font(.system(size: 11)).foregroundStyle(.secondary)
         }
+    }
+
+    private func announcedResetNotice(at expectedAt: Date, now: Date) -> some View {
+        let delayed = expectedAt <= now
+        return HStack(alignment: .center, spacing: 11) {
+            Image(systemName: delayed ? "clock.badge.exclamationmark" : "clock.arrow.circlepath")
+                .font(.system(size: 18, weight: .medium))
+                .frame(width: 25)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(delayed ? "Reset delayed" : "Reset announced")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Expected " + expectedAt.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Text(delayed ? "Waiting" : ProviderReading.remainingTime(until: expectedAt, at: now) ?? "—")
+                .font(.system(size: 17, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+        }
+        .foregroundStyle(ProviderPalette.amber)
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(ProviderPalette.amber.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(ProviderPalette.amber.opacity(0.24), lineWidth: 1))
     }
 }
 

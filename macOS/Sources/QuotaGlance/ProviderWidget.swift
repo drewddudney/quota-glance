@@ -209,6 +209,7 @@ struct ProviderReading {
     let status: String
     let live: Bool
     var resetChance: Double? = nil
+    var announcedResetAt: Date? = nil
     var fiveHourUsage: Double? = nil
     var fiveHourRemaining: String? = nil
     var thirdValue: Double? { provider == .codex ? resetChance : fiveHourUsage }
@@ -216,8 +217,15 @@ struct ProviderReading {
     var tint: Color { provider.tint }
     var help: String {
         "\(name): \(Self.percent(usage)) weekly usage, \(Self.percent(calendar, calendar: true)) week elapsed. "
-        + (provider == .codex ? "\(Self.percent(resetChance)) reset forecast. " : "\(Self.percent(fiveHourUsage)) five-hour usage, \(fiveHourRemaining ?? "unknown time") remaining. ")
+        + (provider == .codex
+            ? "\(Self.percent(resetChance)) reset forecast. " + (announcedResetCountdown(at: .now).map { "Announced reset \($0). " } ?? "")
+            : "\(Self.percent(fiveHourUsage)) five-hour usage, \(fiveHourRemaining ?? "unknown time") remaining. ")
         + "\(status). Click for details; drag to move."
+    }
+    func announcedResetCountdown(at now: Date) -> String? {
+        guard let announcedResetAt else { return nil }
+        guard announcedResetAt > now else { return "Delayed" }
+        return Self.remainingTime(until: announcedResetAt, at: now)
     }
     static func fraction(_ value: Double?) -> CGFloat {
         guard let value, value.isFinite else { return 0 }

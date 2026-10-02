@@ -66,24 +66,31 @@ struct ProviderPetWing: View {
     }
 
     private var resetGauge: some View {
-        HStack(spacing: 5) {
+        let countdown = reading.announcedResetCountdown(at: .now)
+        let announced = countdown != nil
+        let signal = announced ? amber : green
+        return HStack(spacing: 5) {
             ZStack {
                 Circle().trim(from: 0.10, to: 0.90)
-                    .stroke(green.opacity(0.16), style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .stroke(signal.opacity(0.16), style: StrokeStyle(lineWidth: 3, lineCap: .round))
                 Circle().trim(from: 0.10, to: 0.10 + 0.80 * ProviderReading.fraction(reading.resetChance))
-                    .stroke(green, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                Image(systemName: "arrow.counterclockwise")
+                    .stroke(signal, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                Image(systemName: announced ? "clock" : "arrow.counterclockwise")
                     .font(.system(size: 10, weight: .bold)).rotationEffect(.degrees(-90))
-                    .foregroundStyle(green)
+                    .foregroundStyle(signal)
             }.rotationEffect(.degrees(90)).frame(width: 21, height: 21)
             VStack(alignment: .leading, spacing: 1) {
-                Text("RESET").font(.system(size: 6.5, weight: .bold)).tracking(0.7).foregroundStyle(green.opacity(0.72))
-                Text(ProviderReading.percent(reading.resetChance))
-                    .font(.system(size: 14, weight: .semibold, design: .rounded)).monospacedDigit()
-                    .foregroundStyle(green)
+                Text(announced && countdown != "Delayed" ? "RESET IN" : "RESET")
+                    .font(.system(size: 6.5, weight: .bold)).tracking(0.7).foregroundStyle(signal.opacity(0.72))
+                Text(countdown ?? ProviderReading.percent(reading.resetChance))
+                    .font(.system(size: announced ? 12 : 14, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.78)
+                    .foregroundStyle(signal)
             }
-        }.frame(width: 70, height: 29)
-            .help("Codex reset forecast: \(ProviderReading.percent(reading.resetChance))")
+        }.frame(width: 78, height: 29)
+            .help(announced
+                  ? "Codex reset announced for \(reading.announcedResetAt?.formatted(date: .abbreviated, time: .shortened) ?? "unknown time"). Forecast: \(ProviderReading.percent(reading.resetChance))"
+                  : "Codex reset forecast: \(ProviderReading.percent(reading.resetChance))")
     }
 
     private var sessionGauge: some View {

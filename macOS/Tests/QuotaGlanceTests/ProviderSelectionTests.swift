@@ -97,6 +97,18 @@ final class ProviderSelectionTests: XCTestCase {
         XCTAssertTrue(ProviderSelection.claude.filter([readings[0]]).isEmpty)
     }
 
+    func testAnnouncedResetCountdownTurnsDelayedAtItsPinnedTime() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var codex = ProviderReading(provider: .codex, usage: 93, calendar: 85,
+                                    deadline: nil, status: "Live", live: true, resetChance: 100)
+        XCTAssertNil(codex.announcedResetCountdown(at: now))
+        codex.announcedResetAt = now.addingTimeInterval(3_601)
+        XCTAssertEqual(codex.announcedResetCountdown(at: now), "1h 01m")
+        XCTAssertEqual(codex.announcedResetCountdown(at: now.addingTimeInterval(60)), "1h 00m")
+        XCTAssertEqual(codex.announcedResetCountdown(at: codex.announcedResetAt!), "Delayed")
+        XCTAssertEqual(codex.resetChance, 100)
+    }
+
     func testSingleProviderNotchIsCenteredAndUsesHalfTheWidthAtTheSameHeight() {
         let screen = CGRect(x: -2560, y: -200, width: 2560, height: 1440)
         let both = ProviderDisplayGeometry.edgeFrames(screen: screen, safeTop: 0, leftArea: nil, rightArea: nil)
