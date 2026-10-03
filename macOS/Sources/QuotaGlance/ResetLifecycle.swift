@@ -48,8 +48,11 @@ struct ResetLifecycleSnapshot: Codable, Equatable, Sendable {
 enum ResetLifecycleStore {
     private static let defaultsKey = "QuotaGlance.resetLifecycle.v1"
 
-    static func load(at date: Date = Date()) -> ResetLifecycleSnapshot {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+    static func load(
+        at date: Date = Date(),
+        from defaults: UserDefaults = .standard
+    ) -> ResetLifecycleSnapshot {
+        guard let data = defaults.data(forKey: defaultsKey),
               var value = try? decoder.decode(ResetLifecycleSnapshot.self, from: data)
         else { return .empty }
         if let expectedAt = value.expectedAt,
@@ -58,7 +61,7 @@ enum ResetLifecycleStore {
             value.announcementDetectedAt = nil
             value.hasExactAnnouncementTime = nil
             value.expectedAt = nil
-            save(value)
+            save(value, to: defaults)
         }
         return value
     }
@@ -124,9 +127,10 @@ enum ResetLifecycleStore {
         windowStart: Date,
         usedPercent: Double,
         planName: String? = nil,
-        observedAt: Date = Date()
+        observedAt: Date = Date(),
+        defaults: UserDefaults = .standard
     ) -> ResetLifecycleSnapshot {
-        var state = load(at: observedAt)
+        var state = load(at: observedAt, from: defaults)
         let previousWindowStart = state.lastUsageWindowStart
         let previousUsedPercent = state.lastUsedPercent
         let planChanged = state.lastPlanName != nil
@@ -185,7 +189,7 @@ enum ResetLifecycleStore {
         state.lastUsageWindowStart = windowStart
         state.lastUsedPercent = usedPercent
         if let planName { state.lastPlanName = planName }
-        save(state)
+        save(state, to: defaults)
         return state
     }
 
@@ -193,9 +197,9 @@ enum ResetLifecycleStore {
         UserDefaults.standard.removeObject(forKey: defaultsKey)
     }
 
-    private static func save(_ value: ResetLifecycleSnapshot) {
+    private static func save(_ value: ResetLifecycleSnapshot, to defaults: UserDefaults = .standard) {
         guard let data = try? encoder.encode(value) else { return }
-        UserDefaults.standard.set(data, forKey: defaultsKey)
+        defaults.set(data, forKey: defaultsKey)
     }
 
     private static let encoder: JSONEncoder = {

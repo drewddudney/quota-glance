@@ -1689,7 +1689,7 @@ private enum LocalTokenBaselineStore {
     }
 }
 
-private struct CachedCodexEnvelope: Codable {
+struct CachedCodexEnvelope: Codable {
     let savedAt: Date
     let snapshot: CodexSnapshot
 }
@@ -1697,12 +1697,10 @@ private struct CachedCodexEnvelope: Codable {
 /// The graph checkpoints and the live dashboard snapshot have different jobs:
 /// checkpoints build a historical curve, while this cache makes every dial
 /// and pace bucket available immediately after Quota Glance or Codex restarts.
-private enum CodexSnapshotStore {
+enum CodexSnapshotStore {
     private static let directory = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Quota Glance", isDirectory: true)
-    private static let snapshotURL = directory.appendingPathComponent("codex-snapshot-v1.json")
-    private static let backupURL = directory.appendingPathComponent("codex-snapshot-v1.backup.json")
     private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
@@ -1714,13 +1712,20 @@ private enum CodexSnapshotStore {
         return decoder
     }()
 
-    static func load() -> CachedCodexEnvelope? {
-        decode(at: snapshotURL) ?? decode(at: backupURL)
+    static func load(from directory: URL = directory) -> CachedCodexEnvelope? {
+        decode(at: directory.appendingPathComponent("codex-snapshot-v1.json"))
+            ?? decode(at: directory.appendingPathComponent("codex-snapshot-v1.backup.json"))
     }
 
-    static func save(_ incoming: CodexSnapshot, at date: Date = Date()) -> CachedCodexEnvelope {
+    static func save(
+        _ incoming: CodexSnapshot,
+        at date: Date = Date(),
+        in directory: URL = directory
+    ) -> CachedCodexEnvelope {
+        let snapshotURL = directory.appendingPathComponent("codex-snapshot-v1.json")
+        let backupURL = directory.appendingPathComponent("codex-snapshot-v1.backup.json")
         let snapshot: CodexSnapshot
-        if let previous = load()?.snapshot, isSameWindow(previous, incoming) {
+        if let previous = load(from: directory)?.snapshot, isSameWindow(previous, incoming) {
             snapshot = merged(previous: previous, incoming: incoming)
         } else {
             snapshot = incoming
@@ -1775,7 +1780,10 @@ private enum CodexSnapshotStore {
             return byDay.values.sorted { $0.date < $1.date }
         }()
         return CodexSnapshot(
-            usedPercent: max(previous.usedPercent, incoming.usedPercent),
+            // Live quota readings may fall after a reset or provider correction.
+            // Clamping them to the cached maximum also hides reset candidates
+            // from ResetLifecycleStore, which observes this saved snapshot.
+            usedPercent: incoming.usedPercent,
             resetAt: incoming.resetAt,
             resetDeadlineIsCredit: incoming.resetDeadlineIsCredit,
             weeklyTokens: max(previous.weeklyTokens, incoming.weeklyTokens),
@@ -1788,7 +1796,7 @@ private enum CodexSnapshotStore {
             resetCredits: incoming.resetCredits ?? previous.resetCredits,
             activeTasks: incoming.activeTasks ?? previous.activeTasks,
             usageDays: days,
-            usageWindowStart: previous.usageWindowStart,
+            usageWindowStart: incoming.usageWindowStart,
             windowDurationMinutes: incoming.windowDurationMinutes ?? previous.windowDurationMinutes,
             weekElapsedPercent: incoming.weekElapsedPercent,
             planName: incoming.planName == "Codex" ? previous.planName : incoming.planName
